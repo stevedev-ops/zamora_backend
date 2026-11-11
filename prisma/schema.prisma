@@ -1,0 +1,748 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum SupplierStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CustomerStatus {
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+}
+
+enum InventoryMovementType {
+  PURCHASE_IN
+  SALE_OUT
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  DAMAGED
+  EXPIRED
+  RETURN_IN
+  RETURN_OUT
+  OPENING_STOCK
+}
+
+enum SalePaymentMethod {
+  CASH
+  MPESA
+  CREDIT
+  SPLIT
+}
+
+enum SaleStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum PaymentMethod {
+  CASH
+  MPESA
+  BANK_TRANSFER
+  OTHER
+}
+
+enum PaymentType {
+  POS_SALE
+  DEBT_REPAYMENT
+}
+
+enum DebtTransactionType {
+  CREDIT_SALE
+  PAYMENT
+  TRANSFER_OUT
+  TRANSFER_IN
+  ADJUSTMENT_DEBIT
+  ADJUSTMENT_CREDIT
+  REVERSAL
+  OPENING_BALANCE
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+enum DebtTransferStatus {
+  PENDING_ACCEPTANCE
+  COMPLETED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum ExpenseCategory {
+  RENT
+  ELECTRICITY
+  WATER
+  TRANSPORT
+  SALARIES
+  LICENCES
+  REPAIRS
+  OTHER
+}
+
+enum NotificationChannel {
+  SMS
+  WHATSAPP
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum NotificationEventType {
+  CREDIT_SALE
+  PAYMENT_RECEIVED
+  DEBT_TRANSFER_REQUEST
+  DEBT_TRANSFER_COMPLETED
+  DEBT_TRANSFER_REJECTED
+  DEBT_ADJUSTMENT
+  PAYMENT_OVERDUE
+  LOW_STOCK
+  PORTAL_OTP
+  CLARIFICATION_REQUEST
+}
+
+enum ClarificationStatus {
+  OPEN
+  RESOLVED
+}
+
+enum MpesaPurpose {
+  POS_SALE
+  DEBT_REPAYMENT
+  PORTAL_REPAYMENT
+}
+
+enum MpesaStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum AuditActorType {
+  OWNER
+  CUSTOMER_PORTAL
+  SYSTEM
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  name         String
+  email        String    @unique
+  phone        String?
+  passwordHash String    @map("password_hash")
+  role         UserRole  @default(OWNER)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  passwordResetTokens PasswordResetToken[]
+  supplierPurchases   SupplierPurchase[]
+  inventoryMovements  InventoryMovement[]
+  creditLimitsSet     CreditLimit[]
+  sales               Sale[]
+  paymentsReceived    Payment[]
+  transfersInitiated  DebtTransfer[]
+  debtTransactions    DebtTransaction[]
+  expenses            Expense[]
+  auditLogs           AuditLog[]
+
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model Category {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String    @unique
+  slug        String    @unique
+  description String?
+  isDefault   Boolean   @default(false) @map("is_default")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Supplier {
+  id        String         @id @default(uuid()) @db.Uuid
+  name      String
+  phone     String
+  email     String?
+  address   String?
+  notes     String?
+  status    SupplierStatus @default(ACTIVE)
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+
+  products         Product[]
+  purchases        SupplierPurchase[]
+  inventoryBatches InventoryBatch[]
+
+  @@index([name])
+  @@map("suppliers")
+}
+
+model Product {
+  id            String        @id @default(uuid()) @db.Uuid
+  name          String
+  brand         String
+  categoryId    String        @map("category_id") @db.Uuid
+  supplierId    String?       @map("supplier_id") @db.Uuid
+  imageUrl      String?       @map("image_url")
+  barcode       String?       @unique
+  bottleSize    String        @map("bottle_size")
+  purchasePrice Decimal       @map("purchase_price") @db.Decimal(12, 2)
+  sellingPrice  Decimal       @map("selling_price") @db.Decimal(12, 2)
+  currentStock  Int           @default(0) @map("current_stock")
+  minStockAlert Int           @default(5) @map("min_stock_alert")
+  status        ProductStatus @default(ACTIVE)
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  category              Category               @relation(fields: [categoryId], references: [id])
+  supplier              Supplier?              @relation(fields: [supplierId], references: [id])
+  supplierPurchaseItems SupplierPurchaseItem[]
+  inventoryBatches      InventoryBatch[]
+  inventoryMovements    InventoryMovement[]
+  saleItems             SaleItem[]
+
+  @@index([name])
+  @@index([brand])
+  @@index([categoryId])
+  @@index([status])
+  @@map("products")
+}
+
+model SupplierPurchase {
+  id              String   @id @default(uuid()) @db.Uuid
+  referenceNumber String   @unique @map("reference_number")
+  supplierId      String   @map("supplier_id") @db.Uuid
+  purchaseDate    DateTime @default(now()) @map("purchase_date")
+  totalCost       Decimal  @map("total_cost") @db.Decimal(12, 2)
+  notes           String?
+  idempotencyKey  String?  @unique @map("idempotency_key")
+  createdByUserId String   @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  supplier      Supplier               @relation(fields: [supplierId], references: [id])
+  createdByUser User                   @relation(fields: [createdByUserId], references: [id])
+  items         SupplierPurchaseItem[]
+
+  @@index([supplierId, purchaseDate])
+  @@map("supplier_purchases")
+}
+
+model SupplierPurchaseItem {
+  id                 String   @id @default(uuid()) @db.Uuid
+  supplierPurchaseId String   @map("supplier_purchase_id") @db.Uuid
+  productId          String   @map("product_id") @db.Uuid
+  quantity           Int
+  unitCostPrice      Decimal  @map("unit_cost_price") @db.Decimal(12, 2)
+  totalCost          Decimal  @map("total_cost") @db.Decimal(12, 2)
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  supplierPurchase SupplierPurchase @relation(fields: [supplierPurchaseId], references: [id], onDelete: Cascade)
+  product          Product          @relation(fields: [productId], references: [id])
+  inventoryBatch   InventoryBatch?
+
+  @@index([supplierPurchaseId])
+  @@index([productId])
+  @@map("supplier_purchase_items")
+}
+
+model InventoryBatch {
+  id                     String   @id @default(uuid()) @db.Uuid
+  batchNumber            String   @unique @map("batch_number")
+  productId              String   @map("product_id") @db.Uuid
+  supplierId             String?  @map("supplier_id") @db.Uuid
+  supplierPurchaseItemId String?  @unique @map("supplier_purchase_item_id") @db.Uuid
+  purchaseDate           DateTime @default(now()) @map("purchase_date")
+  initialQuantity        Int      @map("initial_quantity")
+  remainingQuantity      Int      @map("remaining_quantity")
+  unitCostPrice          Decimal  @map("unit_cost_price") @db.Decimal(12, 2)
+  totalCost              Decimal  @map("total_cost") @db.Decimal(12, 2)
+  referenceNumber        String?  @map("reference_number")
+  notes                  String?
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  product              Product                   @relation(fields: [productId], references: [id])
+  supplier             Supplier?                 @relation(fields: [supplierId], references: [id])
+  supplierPurchaseItem SupplierPurchaseItem?     @relation(fields: [supplierPurchaseItemId], references: [id])
+  movements            InventoryMovement[]
+  saleAllocations      SaleItemBatchAllocation[]
+
+  @@index([productId, remainingQuantity, purchaseDate])
+  @@map("inventory_batches")
+}
+
+model InventoryMovement {
+  id               String                @id @default(uuid()) @db.Uuid
+  productId        String                @map("product_id") @db.Uuid
+  inventoryBatchId String?               @map("inventory_batch_id") @db.Uuid
+  movementType     InventoryMovementType @map("movement_type")
+  quantityChange   Int                   @map("quantity_change")
+  quantityBefore   Int                   @map("quantity_before")
+  quantityAfter    Int                   @map("quantity_after")
+  unitCostPrice    Decimal               @map("unit_cost_price") @db.Decimal(12, 2)
+  totalCostValue   Decimal               @map("total_cost_value") @db.Decimal(12, 2)
+  referenceType    String?               @map("reference_type")
+  referenceId      String?               @map("reference_id")
+  reason           String?
+  createdByUserId  String?               @map("created_by_user_id") @db.Uuid
+  createdAt        DateTime              @default(now()) @map("created_at")
+
+  product        Product         @relation(fields: [productId], references: [id])
+  inventoryBatch InventoryBatch? @relation(fields: [inventoryBatchId], references: [id])
+  createdByUser  User?           @relation(fields: [createdByUserId], references: [id])
+
+  @@index([productId, createdAt])
+  @@index([movementType])
+  @@map("inventory_movements")
+}
+
+model Customer {
+  id            String         @id @default(uuid()) @db.Uuid
+  accountNumber String         @unique @map("account_number")
+  fullName      String         @map("full_name")
+  phone         String         @unique
+  email         String?
+  status        CustomerStatus @default(ACTIVE)
+  notes         String?
+  registeredAt  DateTime       @default(now()) @map("registered_at")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  account               CustomerAccount?
+  creditLimits          CreditLimit[]
+  sales                 Sale[]
+  payments              Payment[]
+  debtTransactions      DebtTransaction[]
+  transfersOut          DebtTransfer[]         @relation("TransferFrom")
+  transfersIn           DebtTransfer[]         @relation("TransferTo")
+  portalTokens          CustomerPortalToken[]
+  otpChallenges         PortalOtpChallenge[]
+  notifications         Notification[]
+  clarificationRequests ClarificationRequest[]
+  mpesaTransactions     MpesaTransaction[]
+
+  @@index([fullName])
+  @@map("customers")
+}
+
+model CustomerAccount {
+  id                  String    @id @default(uuid()) @db.Uuid
+  customerId          String    @unique @map("customer_id") @db.Uuid
+  currentBalance      Decimal   @default(0) @map("current_balance") @db.Decimal(12, 2)
+  creditLimit         Decimal   @default(0) @map("credit_limit") @db.Decimal(12, 2)
+  totalPurchases      Decimal   @default(0) @map("total_purchases") @db.Decimal(12, 2)
+  totalPayments       Decimal   @default(0) @map("total_payments") @db.Decimal(12, 2)
+  totalTransferredIn  Decimal   @default(0) @map("total_transferred_in") @db.Decimal(12, 2)
+  totalTransferredOut Decimal   @default(0) @map("total_transferred_out") @db.Decimal(12, 2)
+  lastTransactionAt   DateTime? @map("last_transaction_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  customer         Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  debtTransactions DebtTransaction[]
+
+  @@index([currentBalance])
+  @@map("customer_accounts")
+}
+
+model CreditLimit {
+  id            String   @id @default(uuid()) @db.Uuid
+  customerId    String   @map("customer_id") @db.Uuid
+  limitAmount   Decimal  @map("limit_amount") @db.Decimal(12, 2)
+  previousLimit Decimal  @map("previous_limit") @db.Decimal(12, 2)
+  reason        String?
+  isActive      Boolean  @default(true) @map("is_active")
+  setByUserId   String   @map("set_by_user_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  customer  Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  setByUser User     @relation(fields: [setByUserId], references: [id])
+
+  @@index([customerId, isActive])
+  @@map("credit_limits")
+}
+
+model Sale {
+  id                String            @id @default(uuid()) @db.Uuid
+  receiptNumber     String            @unique @map("receipt_number")
+  customerId        String?           @map("customer_id") @db.Uuid
+  subtotal          Decimal           @db.Decimal(12, 2)
+  discountAmount    Decimal           @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  discountReason    String?           @map("discount_reason")
+  totalAmount       Decimal           @map("total_amount") @db.Decimal(12, 2)
+  cashAmount        Decimal           @default(0) @map("cash_amount") @db.Decimal(12, 2)
+  mpesaAmount       Decimal           @default(0) @map("mpesa_amount") @db.Decimal(12, 2)
+  mpesaReference    String?           @map("mpesa_reference")
+  amountPaid        Decimal           @map("amount_paid") @db.Decimal(12, 2)
+  outstandingAmount Decimal           @map("outstanding_amount") @db.Decimal(12, 2)
+  totalCost         Decimal           @map("total_cost") @db.Decimal(12, 2)
+  grossProfit       Decimal           @map("gross_profit") @db.Decimal(12, 2)
+  paymentMethod     SalePaymentMethod @map("payment_method")
+  status            SaleStatus        @default(COMPLETED)
+  notes             String?
+  idempotencyKey    String?           @unique @map("idempotency_key")
+  createdByUserId   String            @map("created_by_user_id") @db.Uuid
+  soldAt            DateTime          @default(now()) @map("sold_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
+
+  customer              Customer?              @relation(fields: [customerId], references: [id])
+  createdByUser         User                   @relation(fields: [createdByUserId], references: [id])
+  items                 SaleItem[]
+  payments              Payment[]
+  debtTransactions      DebtTransaction[]
+  clarificationRequests ClarificationRequest[]
+  mpesaTransactions     MpesaTransaction[]
+
+  @@index([soldAt])
+  @@index([customerId, soldAt])
+  @@index([paymentMethod])
+  @@map("sales")
+}
+
+model SaleItem {
+  id               String   @id @default(uuid()) @db.Uuid
+  saleId           String   @map("sale_id") @db.Uuid
+  productId        String   @map("product_id") @db.Uuid
+  productName      String   @map("product_name")
+  brand            String
+  bottleSize       String   @map("bottle_size")
+  quantity         Int
+  unitSellingPrice Decimal  @map("unit_selling_price") @db.Decimal(12, 2)
+  unitCostPrice    Decimal  @map("unit_cost_price") @db.Decimal(12, 2)
+  lineTotal        Decimal  @map("line_total") @db.Decimal(12, 2)
+  lineCost         Decimal  @map("line_cost") @db.Decimal(12, 2)
+  lineProfit       Decimal  @map("line_profit") @db.Decimal(12, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  sale             Sale                      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product          Product                   @relation(fields: [productId], references: [id])
+  batchAllocations SaleItemBatchAllocation[]
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+model SaleItemBatchAllocation {
+  id               String  @id @default(uuid()) @db.Uuid
+  saleItemId       String  @map("sale_item_id") @db.Uuid
+  inventoryBatchId String  @map("inventory_batch_id") @db.Uuid
+  quantity         Int
+  unitCostPrice    Decimal @map("unit_cost_price") @db.Decimal(12, 2)
+  totalCost        Decimal @map("total_cost") @db.Decimal(12, 2)
+
+  saleItem       SaleItem       @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  inventoryBatch InventoryBatch @relation(fields: [inventoryBatchId], references: [id])
+
+  @@index([saleItemId])
+  @@index([inventoryBatchId])
+  @@map("sale_item_batch_allocations")
+}
+
+model Payment {
+  id                     String        @id @default(uuid()) @db.Uuid
+  referenceNumber        String        @unique @map("reference_number")
+  customerId             String?       @map("customer_id") @db.Uuid
+  saleId                 String?       @map("sale_id") @db.Uuid
+  paymentType            PaymentType   @map("payment_type")
+  amount                 Decimal       @db.Decimal(12, 2)
+  method                 PaymentMethod
+  mpesaReference         String?       @map("mpesa_reference")
+  mpesaCheckoutRequestId String?       @map("mpesa_checkout_request_id")
+  notes                  String?
+  idempotencyKey         String?       @unique @map("idempotency_key")
+  receivedByUserId       String?       @map("received_by_user_id") @db.Uuid
+  paidAt                 DateTime      @default(now()) @map("paid_at")
+  createdAt              DateTime      @default(now()) @map("created_at")
+
+  customer         Customer?         @relation(fields: [customerId], references: [id])
+  sale             Sale?             @relation(fields: [saleId], references: [id])
+  receivedByUser   User?             @relation(fields: [receivedByUserId], references: [id])
+  debtTransactions DebtTransaction[]
+
+  @@index([customerId, paidAt])
+  @@index([paidAt])
+  @@map("payments")
+}
+
+model DebtTransfer {
+  id                    String             @id @default(uuid()) @db.Uuid
+  referenceNumber       String             @unique @map("reference_number")
+  fromCustomerId        String             @map("from_customer_id") @db.Uuid
+  toCustomerId          String             @map("to_customer_id") @db.Uuid
+  amount                Decimal            @db.Decimal(12, 2)
+  reason                String
+  status                DebtTransferStatus @default(PENDING_ACCEPTANCE)
+  confirmationTokenHash String             @unique @map("confirmation_token_hash")
+  otpHash               String             @map("otp_hash")
+  otpExpiresAt          DateTime           @map("otp_expires_at")
+  otpAttempts           Int                @default(0) @map("otp_attempts")
+  acceptedAt            DateTime?          @map("accepted_at")
+  rejectedAt            DateTime?          @map("rejected_at")
+  acceptedMethod        String?            @map("accepted_method")
+  idempotencyKey        String?            @unique @map("idempotency_key")
+  initiatedByUserId     String             @map("initiated_by_user_id") @db.Uuid
+  createdAt             DateTime           @default(now()) @map("created_at")
+  updatedAt             DateTime           @updatedAt @map("updated_at")
+
+  fromCustomer     Customer          @relation("TransferFrom", fields: [fromCustomerId], references: [id])
+  toCustomer       Customer          @relation("TransferTo", fields: [toCustomerId], references: [id])
+  initiatedByUser  User              @relation(fields: [initiatedByUserId], references: [id])
+  debtTransactions DebtTransaction[]
+
+  @@index([fromCustomerId, status])
+  @@index([toCustomerId, status])
+  @@map("debt_transfers")
+}
+
+model DebtTransaction {
+  id                    String              @id @default(uuid()) @db.Uuid
+  referenceNumber       String              @unique @map("reference_number")
+  customerId            String              @map("customer_id") @db.Uuid
+  customerAccountId     String              @map("customer_account_id") @db.Uuid
+  transactionType       DebtTransactionType @map("transaction_type")
+  direction             LedgerDirection
+  amount                Decimal             @db.Decimal(12, 2)
+  runningBalance        Decimal             @map("running_balance") @db.Decimal(12, 2)
+  description           String
+  reason                String?
+  saleId                String?             @map("sale_id") @db.Uuid
+  paymentId             String?             @map("payment_id") @db.Uuid
+  debtTransferId        String?             @map("debt_transfer_id") @db.Uuid
+  reversedTransactionId String?             @unique @map("reversed_transaction_id") @db.Uuid
+  isReversed            Boolean             @default(false) @map("is_reversed")
+  idempotencyKey        String?             @unique @map("idempotency_key")
+  createdByUserId       String?             @map("created_by_user_id") @db.Uuid
+  createdAt             DateTime            @default(now()) @map("created_at")
+
+  customer              Customer               @relation(fields: [customerId], references: [id])
+  customerAccount       CustomerAccount        @relation(fields: [customerAccountId], references: [id])
+  sale                  Sale?                  @relation(fields: [saleId], references: [id])
+  payment               Payment?               @relation(fields: [paymentId], references: [id])
+  debtTransfer          DebtTransfer?          @relation(fields: [debtTransferId], references: [id])
+  reversedTransaction   DebtTransaction?       @relation("LedgerReversal", fields: [reversedTransactionId], references: [id])
+  reversalTransaction   DebtTransaction?       @relation("LedgerReversal")
+  createdByUser         User?                  @relation(fields: [createdByUserId], references: [id])
+  clarificationRequests ClarificationRequest[]
+
+  @@index([customerId, createdAt])
+  @@index([transactionType])
+  @@index([saleId])
+  @@index([paymentId])
+  @@index([debtTransferId])
+  @@map("debt_transactions")
+}
+
+model Expense {
+  id              String          @id @default(uuid()) @db.Uuid
+  referenceNumber String          @unique @map("reference_number")
+  category        ExpenseCategory
+  title           String
+  amount          Decimal         @db.Decimal(12, 2)
+  expenseDate     DateTime        @default(now()) @map("expense_date")
+  paymentMethod   PaymentMethod   @map("payment_method")
+  payee           String?
+  notes           String?
+  createdByUserId String          @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  createdByUser User @relation(fields: [createdByUserId], references: [id])
+
+  @@index([expenseDate])
+  @@index([category])
+  @@map("expenses")
+}
+
+model Notification {
+  id                String                @id @default(uuid()) @db.Uuid
+  customerId        String?               @map("customer_id") @db.Uuid
+  channel           NotificationChannel
+  recipient         String
+  eventType         NotificationEventType @map("event_type")
+  subject           String?
+  message           String
+  status            NotificationStatus    @default(PENDING)
+  provider          String
+  providerMessageId String?               @map("provider_message_id")
+  errorMessage      String?               @map("error_message")
+  isRead            Boolean               @default(false) @map("is_read")
+  sentAt            DateTime?             @map("sent_at")
+  createdAt         DateTime              @default(now()) @map("created_at")
+
+  customer Customer? @relation(fields: [customerId], references: [id])
+
+  @@index([customerId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("notifications")
+}
+
+model CustomerPortalToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  customerId String    @map("customer_id") @db.Uuid
+  token      String    @unique
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  customer      Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  otpChallenges PortalOtpChallenge[]
+
+  @@index([customerId, revokedAt])
+  @@map("customer_portal_tokens")
+}
+
+model PortalOtpChallenge {
+  id            String    @id @default(uuid()) @db.Uuid
+  portalTokenId String    @map("portal_token_id") @db.Uuid
+  customerId    String    @map("customer_id") @db.Uuid
+  otpHash       String    @map("otp_hash")
+  expiresAt     DateTime  @map("expires_at")
+  attempts      Int       @default(0)
+  verifiedAt    DateTime? @map("verified_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  portalToken CustomerPortalToken @relation(fields: [portalTokenId], references: [id], onDelete: Cascade)
+  customer    Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([portalTokenId, createdAt])
+  @@map("portal_otp_challenges")
+}
+
+model ClarificationRequest {
+  id                String              @id @default(uuid()) @db.Uuid
+  customerId        String              @map("customer_id") @db.Uuid
+  debtTransactionId String?             @map("debt_transaction_id") @db.Uuid
+  saleId            String?             @map("sale_id") @db.Uuid
+  message           String
+  status            ClarificationStatus @default(OPEN)
+  ownerResponse     String?             @map("owner_response")
+  resolvedAt        DateTime?           @map("resolved_at")
+  createdAt         DateTime            @default(now()) @map("created_at")
+
+  customer        Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  debtTransaction DebtTransaction? @relation(fields: [debtTransactionId], references: [id])
+  sale            Sale?            @relation(fields: [saleId], references: [id])
+
+  @@index([customerId, status])
+  @@map("clarification_requests")
+}
+
+model MpesaTransaction {
+  id                 String       @id @default(uuid()) @db.Uuid
+  merchantRequestId  String?      @map("merchant_request_id")
+  checkoutRequestId  String       @unique @map("checkout_request_id")
+  purpose            MpesaPurpose
+  customerId         String?      @map("customer_id") @db.Uuid
+  saleId             String?      @map("sale_id") @db.Uuid
+  phoneNumber        String       @map("phone_number")
+  amount             Decimal      @db.Decimal(12, 2)
+  status             MpesaStatus  @default(PENDING)
+  mpesaReceiptNumber String?      @map("mpesa_receipt_number")
+  resultCode         Int?         @map("result_code")
+  resultDesc         String?      @map("result_desc")
+  rawCallback        Json?        @map("raw_callback")
+  createdAt          DateTime     @default(now()) @map("created_at")
+  updatedAt          DateTime     @updatedAt @map("updated_at")
+
+  customer Customer? @relation(fields: [customerId], references: [id])
+  sale     Sale?     @relation(fields: [saleId], references: [id])
+
+  @@index([customerId, status])
+  @@map("mpesa_transactions")
+}
+
+model AuditLog {
+  id         String         @id @default(uuid()) @db.Uuid
+  actorType  AuditActorType @map("actor_type")
+  actorId    String?        @map("actor_id")
+  userId     String?        @map("user_id") @db.Uuid
+  action     String
+  entityType String         @map("entity_type")
+  entityId   String?        @map("entity_id")
+  metadata   Json?
+  ipAddress  String?        @map("ip_address")
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Setting {
+  id                    String   @id @default(uuid()) @db.Uuid
+  key                   String   @unique
+  storeName             String   @default("Zamora Liquor Store") @map("store_name")
+  storePhone            String   @default("+254700000000") @map("store_phone")
+  storeEmail            String?  @map("store_email")
+  storeAddress          String   @default("Nairobi, Kenya") @map("store_address")
+  currency              String   @default("KSh")
+  receiptFooter         String   @default("Thank you for shopping with us! Drink responsibly.") @map("receipt_footer")
+  mpesaEnabled          Boolean  @default(true) @map("mpesa_enabled")
+  mpesaPaybillOrTill    String?  @map("mpesa_paybill_or_till")
+  mpesaAccountReference String?  @map("mpesa_account_reference")
+  smsEnabled            Boolean  @default(true) @map("sms_enabled")
+  whatsappEnabled       Boolean  @default(true) @map("whatsapp_enabled")
+  defaultCreditLimit    Decimal  @default(5000) @map("default_credit_limit") @db.Decimal(12, 2)
+  lowStockDefaultAlert  Int      @default(5) @map("low_stock_default_alert")
+  overdueDaysThreshold  Int      @default(14) @map("overdue_days_threshold")
+  portalRequireOtp      Boolean  @default(false) @map("portal_require_otp")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+model SequenceCounter {
+  name         String   @id
+  currentValue Int      @default(0) @map("current_value")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("sequence_counters")
+}
+
