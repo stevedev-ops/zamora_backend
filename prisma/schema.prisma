@@ -364,6 +364,7 @@ model Customer {
   notifications         Notification[]
   clarificationRequests ClarificationRequest[]
   mpesaTransactions     MpesaTransaction[]
+  saleShares            SaleShare[]
 
   @@index([fullName])
   @@map("customers")
@@ -435,11 +436,33 @@ model Sale {
   debtTransactions      DebtTransaction[]
   clarificationRequests ClarificationRequest[]
   mpesaTransactions     MpesaTransaction[]
+  shares                SaleShare[]
 
   @@index([soldAt])
   @@index([customerId, soldAt])
   @@index([paymentMethod])
   @@map("sales")
+}
+
+model SaleShare {
+  id          String   @id @default(uuid()) @db.Uuid
+  saleId      String   @map("sale_id") @db.Uuid
+  customerId  String?  @map("customer_id") @db.Uuid
+  payerName   String?  @map("payer_name")
+  shareTotal  Decimal  @map("share_total") @db.Decimal(12, 2)
+  cashAmount  Decimal  @default(0) @map("cash_amount") @db.Decimal(12, 2)
+  mpesaAmount Decimal  @default(0) @map("mpesa_amount") @db.Decimal(12, 2)
+  paidAmount  Decimal  @default(0) @map("paid_amount") @db.Decimal(12, 2)
+  debtAmount  Decimal  @default(0) @map("debt_amount") @db.Decimal(12, 2)
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  sale     Sale      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([saleId])
+  @@index([customerId])
+  @@map("sale_shares")
 }
 
 model SaleItem {

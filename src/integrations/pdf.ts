@@ -78,6 +78,14 @@ export async function generateSaleReceiptPdf(
       unitSellingPrice: unknown;
       lineTotal: unknown;
     }>;
+    shares?: Array<{
+      payerName?: string | null;
+      accountNumber?: string | null;
+      shareTotal: unknown;
+      paidAmount: unknown;
+      debtAmount: unknown;
+      notes?: string | null;
+    }>;
   },
   store: StoreHeaderInfo
 ): Promise<Buffer> {
@@ -181,6 +189,30 @@ export async function generateSaleReceiptPdf(
       doc.text(fmtMoney(cur, sale.outstandingAmount), 435, y, { width: 112, align: 'right' });
       doc.fillColor('#0f172a');
       y += 20;
+    }
+
+    if (sale.shares && sale.shares.length > 0) {
+      y += 6;
+      if (y > 700) {
+        doc.addPage();
+        y = 40;
+      }
+      doc.font('Helvetica-Bold').fontSize(9.5).fillColor('#0f172a').text('Split & Debt Share Breakdown:', 40, y);
+      y += 14;
+      doc.font('Helvetica').fontSize(8.5);
+      for (const sh of sale.shares) {
+        if (y > 740) {
+          doc.addPage();
+          y = 40;
+        }
+        const who = sh.accountNumber ? `${sh.payerName} (${sh.accountNumber})` : sh.payerName || 'Payer';
+        const line = `${who}: Share ${fmtMoney(cur, sh.shareTotal)} | Paid ${fmtMoney(
+          cur,
+          sh.paidAmount
+        )} | Debt ${fmtMoney(cur, sh.debtAmount)}${sh.notes ? ` — ${sh.notes}` : ''}`;
+        doc.fillColor('#334155').text(line, 46, y, { width: 505 });
+        y = doc.y + 4;
+      }
     }
 
     doc.moveDown(2);

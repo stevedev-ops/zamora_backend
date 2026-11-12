@@ -48,3 +48,4 @@ export function formatMpesaPaymentSummary(
   const acct = settings.mpesaAccountReference?.trim() || customerAccountNumber?.trim() || '';
   return acct ? `M-Pesa Paybill: ${number} | Account: ${acct}` : `M-Pesa Paybill: ${number}`;
 }
+

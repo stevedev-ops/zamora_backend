@@ -266,6 +266,19 @@ export async function getCustomerPortalDashboard(
               lineTotal: true,
             },
           },
+          shares: {
+            select: {
+              id: true,
+              customerId: true,
+              payerName: true,
+              shareTotal: true,
+              paidAmount: true,
+              debtAmount: true,
+              notes: true,
+              customer: { select: { fullName: true, accountNumber: true } },
+            },
+            orderBy: { createdAt: 'asc' },
+          },
         },
       },
       payment: {
@@ -389,6 +402,16 @@ export async function getCustomerPortalDashboard(
               unitSellingPrice: toNumber(i.unitSellingPrice),
               lineTotal: toNumber(i.lineTotal),
             })),
+            shares: (t.sale.shares ?? []).map((sh) => ({
+              id: sh.id,
+              isMine: sh.customerId === customerId,
+              payerName: sh.customer?.fullName || sh.payerName || 'Payer',
+              accountNumber: sh.customer?.accountNumber ?? null,
+              shareTotal: toNumber(sh.shareTotal),
+              paidAmount: toNumber(sh.paidAmount),
+              debtAmount: toNumber(sh.debtAmount),
+              notes: sh.notes,
+            })),
           }
         : null,
       payment: t.payment,
@@ -429,11 +452,26 @@ export async function getCustomerPortalSaleReceipt(customerId: string, saleId: s
           lineTotal: true,
         },
       },
+      shares: {
+        select: {
+          id: true,
+          customerId: true,
+          payerName: true,
+          shareTotal: true,
+          paidAmount: true,
+          debtAmount: true,
+          notes: true,
+          customer: { select: { fullName: true, accountNumber: true } },
+        },
+        orderBy: { createdAt: 'asc' },
+      },
     },
   });
 
   if (!sale) throw new NotFoundError('Receipt not found');
-  if (sale.customerId !== customerId) {
+  const belongsToCustomer =
+    sale.customerId === customerId || sale.shares.some((s) => s.customerId === customerId);
+  if (!belongsToCustomer) {
     throw new ForbiddenError('You can only view your own receipts');
   }
 
@@ -460,6 +498,15 @@ export async function getCustomerPortalSaleReceipt(customerId: string, saleId: s
       quantity: i.quantity,
       unitSellingPrice: toNumber(i.unitSellingPrice),
       lineTotal: toNumber(i.lineTotal),
+    })),
+    shares: sale.shares.map((sh) => ({
+      id: sh.id,
+      payerName: sh.customer?.fullName || sh.payerName || 'Payer',
+      accountNumber: sh.customer?.accountNumber ?? null,
+      shareTotal: toNumber(sh.shareTotal),
+      paidAmount: toNumber(sh.paidAmount),
+      debtAmount: toNumber(sh.debtAmount),
+      notes: sh.notes,
     })),
   };
 }

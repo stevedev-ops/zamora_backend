@@ -205,3 +205,4 @@ describe('Calendar Day Timezone Window & Daily Closing Summary', () => {
     expect(summary.sales[2].notes).toBe('Bought for Mike');
   });
 });
+

@@ -10,6 +10,107 @@ import { allocateFifoBatchesTx, restoreBatchAllocationsTx } from './inventory.se
 import { appendLedgerEntryTx, lockCustomerAccountTx } from './debt.service';
 import { notifyCustomerDebtEvent } from '../integrations/notifications';
 
+export interface SplitShareInput {
+  customerId?: string | null;
+  payerName?: string | null;
+  cashAmount?: number;
+  mpesaAmount?: number;
+  debtAmount?: number;
+  notes?: string | null;
+}
+
+export interface NormalizedSplitShare {
+  customerId: string | null;
+  payerName: string | null;
+  cashAmount: Decimal;
+  mpesaAmount: Decimal;
+  paidAmount: Decimal;
+  debtAmount: Decimal;
+  shareTotal: Decimal;
+  notes: string | null;
+}
+
+/**
+ * Validates multi-person bill split rows and ensures their totals sum strictly to the net sale total.
+ */
+export function normalizeAndValidateSplitShares(
+  rawShares: SplitShareInput[],
+  totalAmount: Decimal
+) {
+  if (!Array.isArray(rawShares) || rawShares.length < 2) {
+    throw new ValidationError('Multi-person split requires at least 2 payer shares');
+  }
+  if (rawShares.length > 10) {
+    throw new ValidationError('Maximum 10 split shares are supported per sale');
+  }
+
+  let sumTotal = new Decimal(0);
+  let totalCash = new Decimal(0);
+  let totalMpesa = new Decimal(0);
+  let totalDebt = new Decimal(0);
+  const debtByCustomer = new Map<string, Decimal>();
+  const shares: NormalizedSplitShare[] = [];
+
+  for (let idx = 0; idx < rawShares.length; idx += 1) {
+    const raw = rawShares[idx];
+    const cash = addMoney(raw.cashAmount ?? 0, 0);
+    const mpesa = addMoney(raw.mpesaAmount ?? 0, 0);
+    const debt = addMoney(raw.debtAmount ?? 0, 0);
+
+    if (cash.lt(0) || mpesa.lt(0) || debt.lt(0)) {
+      throw new ValidationError(`Share #${idx + 1} cannot have negative amounts`);
+    }
+
+    const paid = addMoney(cash, mpesa);
+    const shareTotal = addMoney(paid, debt);
+    if (shareTotal.lte(0)) {
+      throw new ValidationError(`Share #${idx + 1} total must be greater than zero`);
+    }
+
+    const customerId = raw.customerId?.trim() || null;
+    if (debt.gt(0) && !customerId) {
+      throw new ValidationError(
+        `Share #${idx + 1} has debt (KSh ${debt.toFixed(2)}) and must select a registered customer`
+      );
+    }
+
+    sumTotal = addMoney(sumTotal, shareTotal);
+    totalCash = addMoney(totalCash, cash);
+    totalMpesa = addMoney(totalMpesa, mpesa);
+    totalDebt = addMoney(totalDebt, debt);
+
+    if (customerId && debt.gt(0)) {
+      debtByCustomer.set(customerId, addMoney(debtByCustomer.get(customerId) ?? 0, debt));
+    }
+
+    shares.push({
+      customerId,
+      payerName: raw.payerName?.trim() || null,
+      cashAmount: cash,
+      mpesaAmount: mpesa,
+      paidAmount: paid,
+      debtAmount: debt,
+      shareTotal,
+      notes: raw.notes?.trim() || null,
+    });
+  }
+
+  if (!sumTotal.eq(totalAmount)) {
+    throw new ValidationError(
+      `Split shares total (KSh ${sumTotal.toFixed(2)}) must equal sale total (KSh ${totalAmount.toFixed(2)})`
+    );
+  }
+
+  return {
+    shares,
+    totalCash,
+    totalMpesa,
+    totalPaid: addMoney(totalCash, totalMpesa),
+    totalDebt,
+    debtByCustomer,
+  };
+}
+
 export interface CreateSaleInput {
   customerId?: string | null;
   items: Array<{
@@ -25,6 +126,7 @@ export interface CreateSaleInput {
   notes?: string;
   allowCreditLimitOverride?: boolean;
   idempotencyKey?: string;
+  splitShares?: SplitShareInput[];
 }
 
 export async function createSale(input: CreateSaleInput, userId: string, ipAddress?: string) {
@@ -39,6 +141,10 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
         customer: { select: { id: true, fullName: true, accountNumber: true, phone: true } },
         items: true,
         payments: true,
+        shares: {
+          include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
     if (existing) {
@@ -88,11 +194,25 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
 
     const totalAmount = subMoney(subtotal, discountDec);
 
+    const hasMultiShares =
+      input.paymentMethod === 'SPLIT' &&
+      Array.isArray(input.splitShares) &&
+      input.splitShares.length >= 2;
+
+    if (input.paymentMethod !== 'SPLIT' && input.splitShares && input.splitShares.length > 0) {
+      throw new ValidationError('Multi-person split shares require paymentMethod=SPLIT');
+    }
+
     // Compute payment breakdown strictly on backend
     let cashDec = new Decimal(0);
     let mpesaDec = new Decimal(0);
+    let validatedShares: ReturnType<typeof normalizeAndValidateSplitShares> | null = null;
 
-    if (input.paymentMethod === 'CASH') {
+    if (hasMultiShares) {
+      validatedShares = normalizeAndValidateSplitShares(input.splitShares!, totalAmount);
+      cashDec = validatedShares.totalCash;
+      mpesaDec = validatedShares.totalMpesa;
+    } else if (input.paymentMethod === 'CASH') {
       cashDec = totalAmount;
     } else if (input.paymentMethod === 'MPESA') {
       mpesaDec = totalAmount;
@@ -113,24 +233,71 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
     const amountPaid = addMoney(cashDec, mpesaDec);
     const outstandingAmount = subMoney(totalAmount, amountPaid);
 
-    // Enforce credit rules
-    let customerRecord: {
+    // Load and validate customers & credit limits
+    type CustomerMini = {
       id: string;
       fullName: string;
       accountNumber: string;
       phone: string;
       status: string;
-    } | null = null;
-
-    if (input.customerId) {
-      customerRecord = await tx.customer.findUnique({
-        where: { id: input.customerId },
-        select: { id: true, fullName: true, accountNumber: true, phone: true, status: true },
-      });
-      if (!customerRecord) throw new NotFoundError('Selected customer not found');
+    };
+    const customerMap = new Map<string, CustomerMini>();
+    const allCustomerIds = new Set<string>();
+    if (input.customerId) allCustomerIds.add(input.customerId);
+    if (validatedShares) {
+      for (const s of validatedShares.shares) {
+        if (s.customerId) allCustomerIds.add(s.customerId);
+      }
     }
 
-    if (outstandingAmount.gt(0)) {
+    if (allCustomerIds.size > 0) {
+      const custRows = await tx.customer.findMany({
+        where: { id: { in: Array.from(allCustomerIds) } },
+        select: { id: true, fullName: true, accountNumber: true, phone: true, status: true },
+      });
+      for (const c of custRows) customerMap.set(c.id, c);
+      for (const cid of allCustomerIds) {
+        if (!customerMap.has(cid)) {
+          throw new NotFoundError('Selected customer not found');
+        }
+      }
+    }
+
+    let customerRecord: CustomerMini | null = input.customerId
+      ? customerMap.get(input.customerId) ?? null
+      : null;
+
+    if (validatedShares) {
+      const debtorIds = Array.from(validatedShares.debtByCustomer.keys()).sort();
+      for (const debtorId of debtorIds) {
+        const cust = customerMap.get(debtorId)!;
+        const addedDebt = validatedShares.debtByCustomer.get(debtorId)!;
+        if (cust.status !== 'ACTIVE') {
+          throw new ValidationError(
+            `Customer ${cust.fullName} is ${cust.status.toLowerCase()} and cannot make credit purchases`
+          );
+        }
+        const lockedAccount = await lockCustomerAccountTx(tx, cust.id);
+        const currentBal = toDecimal(lockedAccount.current_balance);
+        const creditLimit = toDecimal(lockedAccount.credit_limit);
+        const projectedBal = addMoney(currentBal, addedDebt);
+        if (projectedBal.gt(creditLimit) && !input.allowCreditLimitOverride) {
+          throw new ValidationError(
+            `Credit limit exceeded for ${cust.fullName}. Current debt: KSh ${currentBal.toFixed(
+              2
+            )}, Limit: KSh ${creditLimit.toFixed(2)}, Projected: KSh ${projectedBal.toFixed(2)}`
+          );
+        }
+      }
+      if (!customerRecord) {
+        if (debtorIds.length === 1) {
+          customerRecord = customerMap.get(debtorIds[0]) ?? null;
+        } else {
+          const firstLinked = validatedShares.shares.find((s) => s.customerId)?.customerId;
+          if (firstLinked) customerRecord = customerMap.get(firstLinked) ?? null;
+        }
+      }
+    } else if (outstandingAmount.gt(0)) {
       if (!customerRecord) {
         throw new ValidationError('Every credit or partially unpaid sale must belong to a registered customer');
       }
@@ -264,70 +431,203 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
       }
     }
 
-    // Record POS Payments (cash & mpesa)
-    if (cashDec.gt(0)) {
-      const cashPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
-      await tx.payment.create({
-        data: {
-          referenceNumber: cashPayRef,
-          customerId: customerRecord?.id ?? null,
-          saleId: sale.id,
-          paymentType: 'POS_SALE',
-          amount: cashDec.toFixed(2),
-          method: 'CASH',
-          notes: `POS Cash payment for ${receiptNumber}`,
-          receivedByUserId: userId,
-        },
-      });
-    }
+    const debtNotifications: Array<{
+      customer: CustomerMini;
+      newBalance: Decimal;
+      totalAmount: Decimal;
+      amountPaid: Decimal;
+      debtAdded: Decimal;
+      note: string | null;
+    }> = [];
 
-    if (mpesaDec.gt(0)) {
-      const mpesaPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
-      await tx.payment.create({
-        data: {
-          referenceNumber: mpesaPayRef,
-          customerId: customerRecord?.id ?? null,
-          saleId: sale.id,
-          paymentType: 'POS_SALE',
-          amount: mpesaDec.toFixed(2),
-          method: 'MPESA',
-          mpesaReference: input.mpesaReference?.trim() || null,
-          notes: `POS M-Pesa payment for ${receiptNumber}`,
-          receivedByUserId: userId,
-        },
+    if (validatedShares) {
+      const resolvedNames = validatedShares.shares.map((s, idx) => {
+        const cust = s.customerId ? customerMap.get(s.customerId) : undefined;
+        return cust?.fullName || s.payerName || `Person ${idx + 1}`;
       });
-    }
 
-    let newCustomerBalance: Decimal | null = null;
-    if (outstandingAmount.gt(0) && customerRecord) {
-      const cleanNote = input.notes?.trim();
-      const ledgerRes = await appendLedgerEntryTx(tx, {
-        customerId: customerRecord.id,
-        transactionType: 'CREDIT_SALE',
-        direction: 'DEBIT',
-        amount: outstandingAmount,
-        description: `Credit purchase ${receiptNumber} (Total KSh ${totalAmount.toFixed(
-          2
-        )}, Paid KSh ${amountPaid.toFixed(2)})${cleanNote ? ` — ${cleanNote}` : ''}`,
-        reason: cleanNote || undefined,
-        saleId: sale.id,
-        userId,
-        accountStatsIncrement: {
-          totalPurchases: totalAmount,
-          totalPayments: amountPaid,
-        },
-      });
-      newCustomerBalance = ledgerRes.newBalance;
-    } else if (customerRecord) {
-      // Fully paid sale linked to a customer -> update historical purchase/payment totals
-      await tx.customerAccount.update({
-        where: { customerId: customerRecord.id },
-        data: {
-          totalPurchases: { increment: totalAmount.toNumber() },
-          totalPayments: { increment: amountPaid.toNumber() },
-          lastTransactionAt: new Date(),
-        },
-      });
+      for (let i = 0; i < validatedShares.shares.length; i += 1) {
+        const share = validatedShares.shares[i];
+        const shareCust = share.customerId ? customerMap.get(share.customerId)! : null;
+        const shareLabel = resolvedNames[i];
+
+        await tx.saleShare.create({
+          data: {
+            saleId: sale.id,
+            customerId: share.customerId,
+            payerName: shareLabel,
+            shareTotal: share.shareTotal.toFixed(2),
+            cashAmount: share.cashAmount.toFixed(2),
+            mpesaAmount: share.mpesaAmount.toFixed(2),
+            paidAmount: share.paidAmount.toFixed(2),
+            debtAmount: share.debtAmount.toFixed(2),
+            notes: share.notes,
+          },
+        });
+
+        if (share.cashAmount.gt(0)) {
+          const cashPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+          await tx.payment.create({
+            data: {
+              referenceNumber: cashPayRef,
+              customerId: share.customerId,
+              saleId: sale.id,
+              paymentType: 'POS_SALE',
+              amount: share.cashAmount.toFixed(2),
+              method: 'CASH',
+              notes: `POS Cash share (${shareLabel}) for ${receiptNumber}`,
+              receivedByUserId: userId,
+            },
+          });
+        }
+
+        if (share.mpesaAmount.gt(0)) {
+          const mpesaPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+          await tx.payment.create({
+            data: {
+              referenceNumber: mpesaPayRef,
+              customerId: share.customerId,
+              saleId: sale.id,
+              paymentType: 'POS_SALE',
+              amount: share.mpesaAmount.toFixed(2),
+              method: 'MPESA',
+              mpesaReference: input.mpesaReference?.trim() || null,
+              notes: `POS M-Pesa share (${shareLabel}) for ${receiptNumber}`,
+              receivedByUserId: userId,
+            },
+          });
+        }
+
+        if (share.debtAmount.gt(0) && shareCust) {
+          const othersText = validatedShares.shares
+            .map((o, oIdx) => {
+              if (oIdx === i) return null;
+              const oName = resolvedNames[oIdx];
+              const parts: string[] = [];
+              if (o.paidAmount.gt(0)) parts.push(`paid KSh ${o.paidAmount.toFixed(2)}`);
+              if (o.debtAmount.gt(0)) parts.push(`debt KSh ${o.debtAmount.toFixed(2)}`);
+              return `${oName} (${parts.join(', ')})`;
+            })
+            .filter(Boolean)
+            .join('; ');
+
+          const explicitNote = [share.notes, input.notes?.trim()].filter(Boolean).join(' — ');
+          const effectiveReason =
+            explicitNote ||
+            (othersText
+              ? `Split bill (Total KSh ${totalAmount.toFixed(2)}): ${othersText}`
+              : undefined);
+
+          const ledgerRes = await appendLedgerEntryTx(tx, {
+            customerId: shareCust.id,
+            transactionType: 'CREDIT_SALE',
+            direction: 'DEBIT',
+            amount: share.debtAmount,
+            description: `Shared purchase ${receiptNumber} (Total KSh ${totalAmount.toFixed(
+              2
+            )}, Your share KSh ${share.shareTotal.toFixed(2)}, Paid KSh ${share.paidAmount.toFixed(
+              2
+            )})${effectiveReason ? ` — ${effectiveReason}` : ''}`,
+            reason: effectiveReason || undefined,
+            saleId: sale.id,
+            userId,
+            accountStatsIncrement: {
+              totalPurchases: share.shareTotal,
+              totalPayments: share.paidAmount,
+            },
+          });
+
+          debtNotifications.push({
+            customer: shareCust,
+            newBalance: ledgerRes.newBalance,
+            totalAmount: share.shareTotal,
+            amountPaid: share.paidAmount,
+            debtAdded: share.debtAmount,
+            note: effectiveReason || null,
+          });
+        } else if (shareCust) {
+          await tx.customerAccount.update({
+            where: { customerId: shareCust.id },
+            data: {
+              totalPurchases: { increment: share.shareTotal.toNumber() },
+              totalPayments: { increment: share.paidAmount.toNumber() },
+              lastTransactionAt: new Date(),
+            },
+          });
+        }
+      }
+    } else {
+      // Record POS Payments (cash & mpesa)
+      if (cashDec.gt(0)) {
+        const cashPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+        await tx.payment.create({
+          data: {
+            referenceNumber: cashPayRef,
+            customerId: customerRecord?.id ?? null,
+            saleId: sale.id,
+            paymentType: 'POS_SALE',
+            amount: cashDec.toFixed(2),
+            method: 'CASH',
+            notes: `POS Cash payment for ${receiptNumber}`,
+            receivedByUserId: userId,
+          },
+        });
+      }
+
+      if (mpesaDec.gt(0)) {
+        const mpesaPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+        await tx.payment.create({
+          data: {
+            referenceNumber: mpesaPayRef,
+            customerId: customerRecord?.id ?? null,
+            saleId: sale.id,
+            paymentType: 'POS_SALE',
+            amount: mpesaDec.toFixed(2),
+            method: 'MPESA',
+            mpesaReference: input.mpesaReference?.trim() || null,
+            notes: `POS M-Pesa payment for ${receiptNumber}`,
+            receivedByUserId: userId,
+          },
+        });
+      }
+
+      if (outstandingAmount.gt(0) && customerRecord) {
+        const cleanNote = input.notes?.trim();
+        const ledgerRes = await appendLedgerEntryTx(tx, {
+          customerId: customerRecord.id,
+          transactionType: 'CREDIT_SALE',
+          direction: 'DEBIT',
+          amount: outstandingAmount,
+          description: `Credit purchase ${receiptNumber} (Total KSh ${totalAmount.toFixed(
+            2
+          )}, Paid KSh ${amountPaid.toFixed(2)})${cleanNote ? ` — ${cleanNote}` : ''}`,
+          reason: cleanNote || undefined,
+          saleId: sale.id,
+          userId,
+          accountStatsIncrement: {
+            totalPurchases: totalAmount,
+            totalPayments: amountPaid,
+          },
+        });
+        debtNotifications.push({
+          customer: customerRecord,
+          newBalance: ledgerRes.newBalance,
+          totalAmount,
+          amountPaid,
+          debtAdded: outstandingAmount,
+          note: cleanNote || null,
+        });
+      } else if (customerRecord) {
+        // Fully paid sale linked to a customer -> update historical purchase/payment totals
+        await tx.customerAccount.update({
+          where: { customerId: customerRecord.id },
+          data: {
+            totalPurchases: { increment: totalAmount.toNumber() },
+            totalPayments: { increment: amountPaid.toNumber() },
+            lastTransactionAt: new Date(),
+          },
+        });
+      }
     }
 
     await recordAuditLog(tx, {
@@ -346,6 +646,7 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
         totalCost: totalCost.toNumber(),
         grossProfit: grossProfit.toNumber(),
         creditLimitOverridden: Boolean(input.allowCreditLimitOverride),
+        splitSharesCount: validatedShares ? validatedShares.shares.length : 0,
       },
       ipAddress,
     });
@@ -356,28 +657,30 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
         customer: { select: { id: true, fullName: true, accountNumber: true, phone: true } },
         items: true,
         payments: true,
+        shares: {
+          include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
 
-    return { fullSale, customerRecord, newCustomerBalance };
+    return { fullSale, debtNotifications };
   });
 
-  if (created.newCustomerBalance !== null && created.customerRecord) {
-    const noteSuffix = created.fullSale.notes?.trim()
-      ? ` Note: ${created.fullSale.notes.trim()}.`
-      : '';
+  for (const notif of created.debtNotifications) {
+    const noteSuffix = notif.note ? ` Note: ${notif.note}.` : '';
     await notifyCustomerDebtEvent({
-      customerId: created.customerRecord.id,
-      customerName: created.customerRecord.fullName,
-      customerPhone: created.customerRecord.phone,
+      customerId: notif.customer.id,
+      customerName: notif.customer.fullName,
+      customerPhone: notif.customer.phone,
       eventType: 'CREDIT_SALE',
       subject: `Credit Purchase ${created.fullSale.receiptNumber}`,
-      messageBody: `a purchase (${created.fullSale.receiptNumber}) of KSh ${toFixed2(
-        created.fullSale.totalAmount
-      )} was recorded (Paid: KSh ${toFixed2(created.fullSale.amountPaid)}, Added to debt: KSh ${toFixed2(
-        created.fullSale.outstandingAmount
+      messageBody: `a purchase (${created.fullSale.receiptNumber}) share of KSh ${toFixed2(
+        notif.totalAmount
+      )} was recorded (Paid: KSh ${toFixed2(notif.amountPaid)}, Added to debt: KSh ${toFixed2(
+        notif.debtAdded
       )}).${noteSuffix}`,
-      newBalance: created.newCustomerBalance.toFixed(2),
+      newBalance: notif.newBalance.toFixed(2),
     });
   }
 
@@ -417,11 +720,17 @@ export async function updateCreditSaleItems(
       include: {
         customer: { select: { id: true, fullName: true, accountNumber: true, phone: true, status: true } },
         items: { include: { batchAllocations: true } },
+        shares: { select: { id: true } },
       },
     });
     if (!sale) throw new NotFoundError('Sale not found');
     if (sale.status === 'VOIDED') {
       throw new ValidationError('This bill has already been voided and cannot be edited');
+    }
+    if ((sale.shares?.length ?? 0) > 1) {
+      throw new ValidationError(
+        'Multi-person split receipts cannot be edited via Drinks Tab; use Debt Adjustment or Reversal instead'
+      );
     }
     if (!sale.customerId || !sale.customer) {
       throw new ValidationError('Only customer-linked sales/tabs can be edited here');
@@ -716,6 +1025,10 @@ export async function listSales(params?: {
       customer: { select: { id: true, fullName: true, accountNumber: true, phone: true } },
       items: true,
       payments: true,
+      shares: {
+        include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+        orderBy: { createdAt: 'asc' },
+      },
     },
     orderBy: { soldAt: 'desc' },
     take: params?.limit ?? 100,
@@ -731,6 +1044,10 @@ export async function getSaleById(id: string) {
       customer: { select: { id: true, fullName: true, accountNumber: true, phone: true } },
       items: true,
       payments: true,
+      shares: {
+        include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+        orderBy: { createdAt: 'asc' },
+      },
     },
   });
   if (!sale) throw new NotFoundError('Sale not found');
@@ -779,6 +1096,18 @@ function formatSale(sale: {
     mpesaReference: string | null;
     paidAt: Date;
   }>;
+  shares?: Array<{
+    id: string;
+    customerId: string | null;
+    payerName: string | null;
+    shareTotal: unknown;
+    cashAmount: unknown;
+    mpesaAmount: unknown;
+    paidAmount: unknown;
+    debtAmount: unknown;
+    notes: string | null;
+    customer?: { id: string; fullName: string; accountNumber: string } | null;
+  }>;
 }) {
   return {
     id: sale.id,
@@ -821,6 +1150,18 @@ function formatSale(sale: {
       method: p.method,
       mpesaReference: p.mpesaReference,
       paidAt: p.paidAt,
+    })),
+    shares: (sale.shares ?? []).map((sh) => ({
+      id: sh.id,
+      customerId: sh.customerId,
+      payerName: sh.customer?.fullName || sh.payerName || 'Walk-in Payer',
+      accountNumber: sh.customer?.accountNumber ?? null,
+      shareTotal: toNumber(sh.shareTotal as number),
+      cashAmount: toNumber(sh.cashAmount as number),
+      mpesaAmount: toNumber(sh.mpesaAmount as number),
+      paidAmount: toNumber(sh.paidAmount as number),
+      debtAmount: toNumber(sh.debtAmount as number),
+      notes: sh.notes,
     })),
   };
 }

@@ -410,6 +410,7 @@ export async function deleteCustomer(
     });
 
     await tx.sale.updateMany({ where: { customerId: id }, data: { customerId: null } });
+    await tx.saleShare.updateMany({ where: { customerId: id }, data: { customerId: null } });
     await tx.payment.updateMany({ where: { customerId: id }, data: { customerId: null } });
     await tx.notification.updateMany({ where: { customerId: id }, data: { customerId: null } });
     await tx.mpesaTransaction.updateMany({ where: { customerId: id }, data: { customerId: null } });

@@ -36,6 +36,20 @@ const createSaleSchema = z.object({
   notes: z.string().max(500).optional(),
   allowCreditLimitOverride: z.boolean().optional(),
   idempotencyKey: z.string().max(120).optional(),
+  splitShares: z
+    .array(
+      z.object({
+        customerId: z.string().uuid().nullable().optional(),
+        payerName: z.string().max(120).nullable().optional(),
+        cashAmount: z.coerce.number().min(0).optional(),
+        mpesaAmount: z.coerce.number().min(0).optional(),
+        debtAmount: z.coerce.number().min(0).optional(),
+        notes: z.string().max(300).nullable().optional(),
+      })
+    )
+    .min(2)
+    .max(10)
+    .optional(),
 });
 
 const updateSaleItemsSchema = z.object({
