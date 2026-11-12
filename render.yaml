@@ -18,7 +18,11 @@ services:
       - key: PORTAL_JWT_SECRET
         generateValue: true
       - key: FRONTEND_URL
-        sync: false
+        value: https://zamora-beta.vercel.app
+      - key: OWNER_EMAIL
+        value: owner@zamoraliquor.com
+      - key: OWNER_PASSWORD
+        value: OwnerPass123!
       - key: COOKIE_SECURE
         value: "true"
       - key: COOKIE_SAME_SITE

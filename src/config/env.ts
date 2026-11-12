@@ -28,11 +28,14 @@ function parseOrigins(...values: Array<string | undefined>): string[] {
   return Array.from(seen);
 }
 
+const defaultFrontendUrl = isProd
+  ? 'https://zamora-beta.vercel.app'
+  : 'http://localhost:5173';
 const frontendUrls = parseOrigins(
-  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.FRONTEND_URL || defaultFrontendUrl,
   process.env.CORS_ORIGINS
 );
-const primaryFrontendUrl = frontendUrls[0] || 'http://localhost:5173';
+const primaryFrontendUrl = frontendUrls[0] || defaultFrontendUrl;
 const cookieSecure =
   process.env.COOKIE_SECURE !== undefined ? process.env.COOKIE_SECURE === 'true' : isProd;
 const rawSameSite = process.env.COOKIE_SAME_SITE?.toLowerCase();
