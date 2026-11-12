@@ -26,16 +26,32 @@ export function createApp() {
   const app = express();
 
   app.set('trust proxy', 1);
-  app.use(helmet());
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    })
+  );
   app.use(
     cors({
-      origin: env.frontendUrl,
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        const normalized = origin.replace(/\/+$/, '');
+        if (env.frontendUrls.includes('*') || env.frontendUrls.includes(normalized)) {
+          return callback(null, true);
+        }
+        return callback(null, false);
+      },
       credentials: true,
+      exposedHeaders: ['Content-Disposition'],
     })
   );
   app.use(express.json({ limit: '2mb' }));
   app.use(cookieParser());
   app.use('/api', apiLimiter);
+
+  app.get('/', (_req, res) => {
+    res.json({ ok: true, service: 'zamora-liquor-api', health: '/api/health' });
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'zamora-liquor-api', timestamp: new Date().toISOString() });

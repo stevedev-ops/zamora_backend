@@ -28,6 +28,12 @@ const changePasswordSchema = z.object({
   newPassword: z.string().min(8),
 });
 
+const ownerCookieOptions = {
+  httpOnly: true,
+  sameSite: env.cookieSameSite,
+  secure: env.cookieSecure,
+};
+
 router.post(
   '/login',
   authLimiter,
@@ -37,9 +43,7 @@ router.post(
     const result = await authService.loginOwner(email, password, req.ip);
 
     res.cookie('owner_token', result.token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: env.cookieSecure,
+      ...ownerCookieOptions,
       maxAge: 12 * 60 * 60 * 1000,
     });
 
@@ -48,7 +52,7 @@ router.post(
 );
 
 router.post('/logout', (_req, res) => {
-  res.clearCookie('owner_token');
+  res.clearCookie('owner_token', ownerCookieOptions);
   res.json({ message: 'Logged out successfully' });
 });
 

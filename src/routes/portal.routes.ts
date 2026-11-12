@@ -12,6 +12,12 @@ import { generateCustomerStatementPdf, generateSaleReceiptPdf } from '../integra
 
 const router = Router();
 
+const portalCookieOptions = {
+  httpOnly: true,
+  sameSite: env.cookieSameSite,
+  secure: env.cookieSecure,
+};
+
 const verifyOtpSchema = z.object({
   otp: z.string().min(4).max(10),
 });
@@ -60,7 +66,7 @@ router.post(
 
 // Customer portal authenticated endpoints (/api/portal/me/*)
 router.post('/me/logout', (_req, res) => {
-  res.clearCookie('portal_token');
+  res.clearCookie('portal_token', portalCookieOptions);
   res.json({ message: 'Signed out of portal' });
 });
 
@@ -198,9 +204,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const result = await portalService.openPortalDirect(req.params.token as string);
     res.cookie('portal_token', result.sessionToken, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: env.cookieSecure,
+      ...portalCookieOptions,
       maxAge: 2 * 60 * 60 * 1000,
     });
     res.json(result);
@@ -227,9 +231,7 @@ router.post(
     );
 
     res.cookie('portal_token', result.sessionToken, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: env.cookieSecure,
+      ...portalCookieOptions,
       maxAge: 2 * 60 * 60 * 1000,
     });
 
