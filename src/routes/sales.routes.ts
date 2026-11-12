@@ -5,6 +5,7 @@ import { asyncHandler } from '../lib/errors';
 import { requireOwner } from '../middleware/auth';
 import { validateBody } from '../middleware/validate';
 import * as posService from '../services/pos.service';
+import { toggleSaleItemFlag } from '../services/customer.service';
 import { getStoreSettings } from '../services/settings.service';
 import { generateSaleReceiptPdf } from '../integrations/pdf';
 import {
@@ -193,6 +194,27 @@ router.patch(
       req.ip
     );
     res.json(result);
+  })
+);
+
+const flagSaleItemSchema = z.object({
+  isFlagged: z.boolean(),
+  flagNote: z.string().max(240).nullable().optional(),
+});
+
+router.patch(
+  '/:id/items/:itemId/flag',
+  validateBody(flagSaleItemSchema),
+  asyncHandler(async (req, res) => {
+    const item = await toggleSaleItemFlag({
+      saleItemId: req.params.itemId as string,
+      isFlagged: req.body.isFlagged,
+      flagNote: req.body.flagNote,
+      actorType: 'OWNER',
+      actorId: req.owner!.id,
+      ipAddress: req.ip,
+    });
+    res.json({ item });
   })
 );
 

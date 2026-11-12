@@ -1567,6 +1567,10 @@ function formatSale(sale: {
     lineTotal: unknown;
     lineCost: unknown;
     lineProfit: unknown;
+    isFlagged?: boolean;
+    flagNote?: string | null;
+    flaggedByType?: string | null;
+    flaggedAt?: Date | null;
   }>;
   payments?: Array<{
     id: string;
@@ -1622,6 +1626,10 @@ function formatSale(sale: {
       lineTotal: toNumber(i.lineTotal as number),
       lineCost: toNumber(i.lineCost as number),
       lineProfit: toNumber(i.lineProfit as number),
+      isFlagged: Boolean(i.isFlagged),
+      flagNote: i.flagNote ?? null,
+      flaggedByType: i.flaggedByType ?? null,
+      flaggedAt: i.flaggedAt ?? null,
     })),
     payments: (sale.payments ?? []).map((p) => ({
       id: p.id,
