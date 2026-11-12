@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  resolve: {
+    preserveSymlinks: process.platform === 'win32',
+  },
   test: {
     environment: 'node',
     globals: true,

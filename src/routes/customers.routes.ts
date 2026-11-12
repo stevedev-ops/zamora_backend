@@ -44,6 +44,11 @@ const shareSchema = z.object({
   channel: z.enum(['SMS', 'WHATSAPP']),
 });
 
+const flagSaleItemSchema = z.object({
+  isFlagged: z.boolean(),
+  flagNote: z.string().max(240).nullable().optional(),
+});
+
 router.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -208,6 +213,23 @@ router.post(
       req.owner!.id
     );
     res.json(result);
+  })
+);
+
+router.patch(
+  '/:id/sale-items/:saleItemId/flag',
+  validateBody(flagSaleItemSchema),
+  asyncHandler(async (req, res) => {
+    const item = await customerService.toggleSaleItemFlag({
+      saleItemId: req.params.saleItemId as string,
+      isFlagged: req.body.isFlagged,
+      flagNote: req.body.flagNote,
+      actorType: 'OWNER',
+      actorId: req.owner!.id,
+      scopeCustomerId: req.params.id as string,
+      ipAddress: req.ip,
+    });
+    res.json({ item });
   })
 );
 

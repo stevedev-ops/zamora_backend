@@ -11,6 +11,7 @@ import {
   finalizeDebtTransferAcceptance,
   rejectOrCancelDebtTransfer,
 } from './debt.service';
+import { toggleSaleItemFlag } from './customer.service';
 
 async function findValidPortalToken(rawToken: string) {
   const tokenRecord = await prisma.customerPortalToken.findUnique({
@@ -264,6 +265,10 @@ export async function getCustomerPortalDashboard(
               quantity: true,
               unitSellingPrice: true,
               lineTotal: true,
+              isFlagged: true,
+              flagNote: true,
+              flaggedByType: true,
+              flaggedAt: true,
             },
           },
           shares: {
@@ -401,6 +406,10 @@ export async function getCustomerPortalDashboard(
               quantity: i.quantity,
               unitSellingPrice: toNumber(i.unitSellingPrice),
               lineTotal: toNumber(i.lineTotal),
+              isFlagged: i.isFlagged,
+              flagNote: i.flagNote,
+              flaggedByType: i.flaggedByType,
+              flaggedAt: i.flaggedAt,
             })),
             shares: (t.sale.shares ?? []).map((sh) => ({
               id: sh.id,
@@ -450,6 +459,10 @@ export async function getCustomerPortalSaleReceipt(customerId: string, saleId: s
           quantity: true,
           unitSellingPrice: true,
           lineTotal: true,
+          isFlagged: true,
+          flagNote: true,
+          flaggedByType: true,
+          flaggedAt: true,
         },
       },
       shares: {
@@ -498,6 +511,10 @@ export async function getCustomerPortalSaleReceipt(customerId: string, saleId: s
       quantity: i.quantity,
       unitSellingPrice: toNumber(i.unitSellingPrice),
       lineTotal: toNumber(i.lineTotal),
+      isFlagged: i.isFlagged,
+      flagNote: i.flagNote,
+      flaggedByType: i.flaggedByType,
+      flaggedAt: i.flaggedAt,
     })),
     shares: sale.shares.map((sh) => ({
       id: sh.id,
@@ -654,6 +671,23 @@ export async function respondToTransferByPublicToken(
     confirmationToken: rawToken,
     action: 'REJECTED',
     actorCustomerId: transfer.toCustomerId,
+  });
+}
+
+export async function flagPortalSaleItem(
+  customerId: string,
+  saleItemId: string,
+  input: { isFlagged: boolean; flagNote?: string | null },
+  ipAddress?: string
+) {
+  return toggleSaleItemFlag({
+    saleItemId,
+    isFlagged: input.isFlagged,
+    flagNote: input.flagNote,
+    actorType: 'CUSTOMER',
+    actorId: customerId,
+    scopeCustomerId: customerId,
+    ipAddress,
   });
 }
 

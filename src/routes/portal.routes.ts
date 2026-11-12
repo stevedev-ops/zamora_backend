@@ -28,6 +28,11 @@ const clarificationSchema = z.object({
   message: z.string().min(5).max(500),
 });
 
+const flagSaleItemSchema = z.object({
+  isFlagged: z.boolean(),
+  flagNote: z.string().max(240).nullable().optional(),
+});
+
 const transferRespondSchema = z.object({
   action: z.enum(['ACCEPT', 'REJECT']),
   otp: z.string().optional(),
@@ -146,6 +151,21 @@ router.post(
       req.body
     );
     res.status(201).json({ request });
+  })
+);
+
+router.patch(
+  '/me/sale-items/:saleItemId/flag',
+  requireCustomerPortal,
+  validateBody(flagSaleItemSchema),
+  asyncHandler(async (req, res) => {
+    const item = await portalService.flagPortalSaleItem(
+      req.portalSession!.customerId,
+      req.params.saleItemId as string,
+      req.body,
+      req.ip
+    );
+    res.json({ item });
   })
 );
 

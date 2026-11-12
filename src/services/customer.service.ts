@@ -4,7 +4,7 @@ import { normalizePhone } from '../lib/phone';
 import { toDecimal, toNumber } from '../lib/money';
 import { nextSequenceNumber } from '../lib/sequences';
 import { generateSecureToken } from '../lib/crypto';
-import { ConflictError, NotFoundError, ValidationError } from '../lib/errors';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors';
 import { recordAuditLog } from '../lib/audit';
 import { env } from '../config/env';
 import { formatMpesaPaymentSummary } from '../lib/mpesaDisplay';
@@ -102,38 +102,47 @@ export async function listCustomers(params?: {
 }
 
 export async function getCustomerProfile(id: string) {
-  const customer = await prisma.customer.findUnique({
-    where: { id },
-    include: {
-      account: true,
-      creditLimits: { orderBy: { createdAt: 'desc' }, take: 20 },
-      sales: {
-        include: {
-          items: true,
+  const [customer, customerSales] = await Promise.all([
+    prisma.customer.findUnique({
+      where: { id },
+      include: {
+        account: true,
+        creditLimits: { orderBy: { createdAt: 'desc' }, take: 20 },
+        payments: {
+          orderBy: { paidAt: 'desc' },
+          take: 50,
         },
-        orderBy: { soldAt: 'desc' },
-        take: 50,
-      },
-      payments: {
-        orderBy: { paidAt: 'desc' },
-        take: 50,
-      },
-      debtTransactions: {
-        include: {
-          sale: { include: { items: true } },
-          payment: true,
-          debtTransfer: {
-            include: {
-              fromCustomer: { select: { id: true, fullName: true, accountNumber: true } },
-              toCustomer: { select: { id: true, fullName: true, accountNumber: true } },
+        debtTransactions: {
+          include: {
+            sale: { include: { items: true } },
+            payment: true,
+            debtTransfer: {
+              include: {
+                fromCustomer: { select: { id: true, fullName: true, accountNumber: true } },
+                toCustomer: { select: { id: true, fullName: true, accountNumber: true } },
+              },
             },
           },
+          orderBy: { createdAt: 'desc' },
+          take: 100,
         },
-        orderBy: { createdAt: 'desc' },
-        take: 100,
       },
-    },
-  });
+    }),
+    prisma.sale.findMany({
+      where: {
+        OR: [{ customerId: id }, { shares: { some: { customerId: id } } }],
+      },
+      include: {
+        items: true,
+        shares: {
+          include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+      orderBy: { soldAt: 'desc' },
+      take: 50,
+    }),
+  ]);
 
   if (!customer) throw new NotFoundError('Customer not found');
 
@@ -175,7 +184,7 @@ export async function getCustomerProfile(id: string) {
       limitAmount: toNumber(cl.limitAmount),
       previousLimit: toNumber(cl.previousLimit),
     })),
-    sales: customer.sales.map((s) => ({
+    sales: customerSales.map((s) => ({
       ...s,
       subtotal: toNumber(s.subtotal),
       discountAmount: toNumber(s.discountAmount),
@@ -193,6 +202,18 @@ export async function getCustomerProfile(id: string) {
         lineTotal: toNumber(i.lineTotal),
         lineCost: toNumber(i.lineCost),
         lineProfit: toNumber(i.lineProfit),
+      })),
+      shares: s.shares.map((sh) => ({
+        id: sh.id,
+        customerId: sh.customerId,
+        payerName: sh.customer?.fullName || sh.payerName || 'Walk-in Payer',
+        accountNumber: sh.customer?.accountNumber ?? null,
+        shareTotal: toNumber(sh.shareTotal),
+        cashAmount: toNumber(sh.cashAmount),
+        mpesaAmount: toNumber(sh.mpesaAmount),
+        paidAmount: toNumber(sh.paidAmount),
+        debtAmount: toNumber(sh.debtAmount),
+        notes: sh.notes,
       })),
     })),
     payments: customer.payments.map((p) => ({
@@ -591,5 +612,115 @@ export async function shareCustomerPortalLink(
     whatsappUrl: buildWhatsAppShareUrl(customer.phone, message),
     status: notification.status,
   };
+}
+
+/**
+ * Shared helper so either the store owner or the authenticated portal customer
+ * can place or clear an asterisk (*) mark (with optional note) on a drink line.
+ */
+export async function toggleSaleItemFlag(params: {
+  saleItemId: string;
+  isFlagged: boolean;
+  flagNote?: string | null;
+  actorType: 'OWNER' | 'CUSTOMER';
+  actorId: string;
+  scopeCustomerId?: string;
+  ipAddress?: string;
+}) {
+  const cleanNote = params.flagNote?.trim() || null;
+  if (cleanNote && cleanNote.length > 240) {
+    throw new ValidationError('Flag note cannot exceed 240 characters');
+  }
+
+  const item = await prisma.saleItem.findUnique({
+    where: { id: params.saleItemId },
+    include: {
+      sale: {
+        select: {
+          id: true,
+          receiptNumber: true,
+          status: true,
+          customerId: true,
+          shares: { select: { customerId: true } },
+          debtTransactions: { select: { customerId: true } },
+        },
+      },
+    },
+  });
+
+  if (!item) {
+    throw new NotFoundError('Drink line item not found');
+  }
+
+  if (params.scopeCustomerId) {
+    const belongsToCustomer =
+      item.sale.customerId === params.scopeCustomerId ||
+      item.sale.shares.some((s) => s.customerId === params.scopeCustomerId) ||
+      item.sale.debtTransactions.some((t) => t.customerId === params.scopeCustomerId);
+
+    if (!belongsToCustomer) {
+      if (params.actorType === 'CUSTOMER') {
+        throw new ForbiddenError('You can only mark drinks on your own account');
+      }
+      throw new NotFoundError('Drink line item does not belong to this customer');
+    }
+  }
+
+  if (item.sale.status === 'VOIDED') {
+    throw new ValidationError('Cannot mark a drink on a voided purchase');
+  }
+
+  const now = new Date();
+  const updated = await prisma.$transaction(async (tx) => {
+    const saved = await tx.saleItem.update({
+      where: { id: item.id },
+      data: params.isFlagged
+        ? {
+            isFlagged: true,
+            flagNote: cleanNote,
+            flaggedByType: params.actorType,
+            flaggedAt: now,
+          }
+        : {
+            isFlagged: false,
+            flagNote: null,
+            flaggedByType: null,
+            flaggedAt: null,
+          },
+      select: {
+        id: true,
+        saleId: true,
+        productName: true,
+        brand: true,
+        bottleSize: true,
+        quantity: true,
+        isFlagged: true,
+        flagNote: true,
+        flaggedByType: true,
+        flaggedAt: true,
+      },
+    });
+
+    await recordAuditLog(tx, {
+      actorType: params.actorType === 'CUSTOMER' ? 'CUSTOMER_PORTAL' : 'OWNER',
+      actorId: params.actorId,
+      userId: params.actorType === 'OWNER' ? params.actorId : undefined,
+      action: params.isFlagged ? 'SALE_ITEM_FLAGGED' : 'SALE_ITEM_UNFLAGGED',
+      entityType: 'SaleItem',
+      entityId: item.id,
+      metadata: {
+        saleId: item.saleId,
+        receiptNumber: item.sale.receiptNumber,
+        productName: item.productName,
+        isFlagged: params.isFlagged,
+        flagNote: params.isFlagged ? cleanNote : null,
+      },
+      ipAddress: params.ipAddress,
+    });
+
+    return saved;
+  });
+
+  return updated;
 }
 

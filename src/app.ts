@@ -45,7 +45,14 @@ export function createApp() {
       exposedHeaders: ['Content-Disposition'],
     })
   );
-  app.use(express.json({ limit: '2mb' }));
+  const defaultJsonParser = express.json({ limit: '2mb' });
+  app.use((req, res, next) => {
+    if (req.path === '/api/settings/backup/restore') {
+      next();
+      return;
+    }
+    defaultJsonParser(req, res, next);
+  });
   app.use(cookieParser());
   app.use('/api', apiLimiter);
 

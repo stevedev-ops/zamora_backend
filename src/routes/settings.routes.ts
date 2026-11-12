@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler } from '../lib/errors';
 import { requireOwner } from '../middleware/auth';
@@ -91,6 +91,25 @@ router.get(
       `attachment; filename="zamora-backup-${new Date().toISOString().slice(0, 10)}.json"`
     );
     res.send(JSON.stringify(snapshot, null, 2));
+  })
+);
+
+const restoreBackupSchema = z.object({
+  confirmReplace: z.literal(true),
+  snapshot: z.unknown(),
+});
+
+router.post(
+  '/backup/restore',
+  express.json({ limit: '25mb' }),
+  validateBody(restoreBackupSchema),
+  asyncHandler(async (req, res) => {
+    const result = await settingsService.restoreDatabaseSnapshot(
+      req.body.snapshot,
+      req.owner!.id,
+      req.ip
+    );
+    res.json(result);
   })
 );
 

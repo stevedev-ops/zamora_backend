@@ -1,4 +1,4 @@
-import { SalePaymentMethod } from '@prisma/client';
+import { Prisma, SalePaymentMethod } from '@prisma/client';
 import Decimal from 'decimal.js';
 import { prisma } from '../lib/prisma';
 import { addMoney, mulMoney, subMoney, toDecimal, toFixed2, toNumber } from '../lib/money';
@@ -694,10 +694,232 @@ export interface UpdateSaleItemsInput {
   notes?: string | null;
   reason?: string;
   allowCreditLimitOverride?: boolean;
+  cashAmount?: number;
+  mpesaAmount?: number;
+  mpesaReference?: string | null;
+  splitShares?: SplitShareInput[];
+}
+
+function deriveSingleSalePaymentMethod(params: {
+  total: Decimal;
+  cash: Decimal;
+  mpesa: Decimal;
+  outstanding: Decimal;
+}): SalePaymentMethod {
+  if (params.total.gt(0)) {
+    if (params.outstanding.eq(params.total)) return 'CREDIT';
+    if (params.cash.eq(params.total)) return 'CASH';
+    if (params.mpesa.eq(params.total)) return 'MPESA';
+  }
+  return 'SPLIT';
 }
 
 /**
- * Allows the owner to add, remove, or edit drink quantities on an existing customer sale/tab
+ * Computes updated cash/M-Pesa/debt amounts when items are edited on a single-payer or walk-in sale.
+ */
+export function resolveUpdatedSingleSalePayments(params: {
+  newTotal: Decimal.Value;
+  oldCash: Decimal.Value;
+  oldMpesa: Decimal.Value;
+  oldPaymentMethod: SalePaymentMethod;
+  isVoided: boolean;
+  hasCustomer: boolean;
+  explicitCash?: number;
+  explicitMpesa?: number;
+}) {
+  const newTotal = toDecimal(params.newTotal);
+  if (params.isVoided || newTotal.isZero()) {
+    return {
+      cashAmount: new Decimal(0),
+      mpesaAmount: new Decimal(0),
+      amountPaid: new Decimal(0),
+      outstandingAmount: new Decimal(0),
+      paymentMethod: params.oldPaymentMethod,
+    };
+  }
+
+  let cash = new Decimal(0);
+  let mpesa = new Decimal(0);
+
+  if (params.explicitCash !== undefined || params.explicitMpesa !== undefined) {
+    cash = addMoney(params.explicitCash ?? 0, 0);
+    mpesa = addMoney(params.explicitMpesa ?? 0, 0);
+    if (cash.lt(0) || mpesa.lt(0)) {
+      throw new ValidationError('Cash and M-Pesa amounts cannot be negative');
+    }
+    const explicitPaid = addMoney(cash, mpesa);
+    if (explicitPaid.gt(newTotal)) {
+      throw new ValidationError('Combined cash and M-Pesa amount exceeds updated sale total');
+    }
+    if (!params.hasCustomer && !explicitPaid.eq(newTotal)) {
+      throw new ValidationError(
+        `Walk-in sale Cash + M-Pesa (KSh ${explicitPaid.toFixed(2)}) must equal updated total (KSh ${newTotal.toFixed(2)})`
+      );
+    }
+  } else {
+    const oldCash = toDecimal(params.oldCash);
+    const oldMpesa = toDecimal(params.oldMpesa);
+    const oldPaid = addMoney(oldCash, oldMpesa);
+
+    if (!params.hasCustomer) {
+      if (params.oldPaymentMethod === 'MPESA' || (oldMpesa.gt(0) && oldCash.isZero())) {
+        mpesa = newTotal;
+      } else if (
+        params.oldPaymentMethod === 'CASH' ||
+        (oldCash.gt(0) && oldMpesa.isZero()) ||
+        oldPaid.isZero()
+      ) {
+        cash = newTotal;
+      } else {
+        cash = newTotal.mul(oldCash).div(oldPaid).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+        mpesa = subMoney(newTotal, cash);
+      }
+    } else if (newTotal.gte(oldPaid)) {
+      cash = oldCash;
+      mpesa = oldMpesa;
+    } else if (oldPaid.gt(0)) {
+      cash = newTotal.mul(oldCash).div(oldPaid).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+      mpesa = subMoney(newTotal, cash);
+    }
+  }
+
+  const amountPaid = addMoney(cash, mpesa);
+  const outstandingAmount = subMoney(newTotal, amountPaid);
+  const paymentMethod = deriveSingleSalePaymentMethod({
+    total: newTotal,
+    cash,
+    mpesa,
+    outstanding: outstandingAmount,
+  });
+
+  return { cashAmount: cash, mpesaAmount: mpesa, amountPaid, outstandingAmount, paymentMethod };
+}
+
+async function replaceSalePosPaymentsTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    saleId: string;
+    receiptNumber: string;
+    userId: string;
+    mpesaReference: string | null;
+    entries: Array<{
+      customerId: string | null;
+      cashAmount: Decimal;
+      mpesaAmount: Decimal;
+      label?: string | null;
+    }>;
+  }
+) {
+  await tx.payment.deleteMany({
+    where: { saleId: params.saleId, paymentType: 'POS_SALE' },
+  });
+
+  for (const entry of params.entries) {
+    if (entry.cashAmount.gt(0)) {
+      const cashPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+      await tx.payment.create({
+        data: {
+          referenceNumber: cashPayRef,
+          customerId: entry.customerId,
+          saleId: params.saleId,
+          paymentType: 'POS_SALE',
+          amount: entry.cashAmount.toFixed(2),
+          method: 'CASH',
+          notes: entry.label
+            ? `POS Cash share (${entry.label}) for ${params.receiptNumber}`
+            : `POS Cash payment for ${params.receiptNumber}`,
+          receivedByUserId: params.userId,
+        },
+      });
+    }
+    if (entry.mpesaAmount.gt(0)) {
+      const mpesaPayRef = await nextSequenceNumber(tx, 'payment', 'PAY', 5);
+      await tx.payment.create({
+        data: {
+          referenceNumber: mpesaPayRef,
+          customerId: entry.customerId,
+          saleId: params.saleId,
+          paymentType: 'POS_SALE',
+          amount: entry.mpesaAmount.toFixed(2),
+          method: 'MPESA',
+          mpesaReference: params.mpesaReference,
+          notes: entry.label
+            ? `POS M-Pesa share (${entry.label}) for ${params.receiptNumber}`
+            : `POS M-Pesa payment for ${params.receiptNumber}`,
+          receivedByUserId: params.userId,
+        },
+      });
+    }
+  }
+}
+
+async function applyCustomerEditDeltaTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    customerId: string;
+    saleId: string;
+    receiptNumber: string;
+    debtDelta: Decimal;
+    purchasesDelta: Decimal;
+    paidDelta: Decimal;
+    isVoided: boolean;
+    cleanNote: string | null;
+    cleanReason?: string;
+    userId: string;
+  }
+) {
+  if (!params.debtDelta.isZero()) {
+    const isIncrease = params.debtDelta.gt(0);
+    const ledgerRes = await appendLedgerEntryTx(tx, {
+      customerId: params.customerId,
+      transactionType: isIncrease ? 'ADJUSTMENT_DEBIT' : 'ADJUSTMENT_CREDIT',
+      direction: isIncrease ? 'DEBIT' : 'CREDIT',
+      amount: params.debtDelta.abs(),
+      description: params.isVoided
+        ? `Voided/removed all drinks on ${params.receiptNumber}${
+            params.cleanNote ? ` — ${params.cleanNote}` : ''
+          }`
+        : `Updated drinks on ${params.receiptNumber} (${
+            isIncrease ? '+' : '-'
+          }KSh ${params.debtDelta.abs().toFixed(2)})${
+            params.cleanNote ? ` — ${params.cleanNote}` : ''
+          }`,
+      reason: params.cleanReason || 'Sale drink items updated',
+      saleId: params.saleId,
+      userId: params.userId,
+      accountStatsIncrement: {
+        ...(!params.purchasesDelta.isZero()
+          ? { totalPurchases: params.purchasesDelta.toNumber() }
+          : {}),
+        ...(!params.paidDelta.isZero() ? { totalPayments: params.paidDelta.toNumber() } : {}),
+      },
+    });
+    return ledgerRes.newBalance;
+  }
+
+  if (!params.purchasesDelta.isZero() || !params.paidDelta.isZero()) {
+    const updated = await tx.customerAccount.update({
+      where: { customerId: params.customerId },
+      data: {
+        ...(!params.purchasesDelta.isZero()
+          ? { totalPurchases: { increment: params.purchasesDelta.toNumber() } }
+          : {}),
+        ...(!params.paidDelta.isZero()
+          ? { totalPayments: { increment: params.paidDelta.toNumber() } }
+          : {}),
+        lastTransactionAt: new Date(),
+      },
+    });
+    return toDecimal(updated.currentBalance);
+  }
+
+  const acc = await lockCustomerAccountTx(tx, params.customerId);
+  return toDecimal(acc.current_balance);
+}
+
+/**
+ * Allows the owner to add, remove, or edit drink quantities on any completed sale
+ * (Walk-in Cash/M-Pesa/Split, Single-Customer Credit/Paid, or Multi-Person Split receipts)
  * while preserving FIFO batch inventory accuracy and immutable debt ledger auditability.
  */
 export async function updateCreditSaleItems(
@@ -720,27 +942,29 @@ export async function updateCreditSaleItems(
       include: {
         customer: { select: { id: true, fullName: true, accountNumber: true, phone: true, status: true } },
         items: { include: { batchAllocations: true } },
-        shares: { select: { id: true } },
+        shares: {
+          include: {
+            customer: { select: { id: true, fullName: true, accountNumber: true, phone: true, status: true } },
+          },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
     if (!sale) throw new NotFoundError('Sale not found');
     if (sale.status === 'VOIDED') {
       throw new ValidationError('This bill has already been voided and cannot be edited');
     }
-    if ((sale.shares?.length ?? 0) > 1) {
-      throw new ValidationError(
-        'Multi-person split receipts cannot be edited via Drinks Tab; use Debt Adjustment or Reversal instead'
-      );
-    }
-    if (!sale.customerId || !sale.customer) {
-      throw new ValidationError('Only customer-linked sales/tabs can be edited here');
-    }
 
-    const lockedAccount = await lockCustomerAccountTx(tx, sale.customerId);
     const oldTotal = toDecimal(sale.totalAmount);
+    const oldCash = toDecimal(sale.cashAmount);
+    const oldMpesa = toDecimal(sale.mpesaAmount);
     const oldAmountPaid = toDecimal(sale.amountPaid);
     const oldOutstanding = toDecimal(sale.outstandingAmount);
     const cleanNote = input.notes !== undefined ? input.notes?.trim() || null : sale.notes;
+    const cleanMpesaRef =
+      input.mpesaReference !== undefined
+        ? input.mpesaReference?.trim() || null
+        : sale.mpesaReference;
     const cleanReason = input.reason?.trim() || cleanNote || undefined;
 
     const oldItemsMap = new Map(sale.items.map((i) => [i.productId, i]));
@@ -756,7 +980,7 @@ export async function updateCreditSaleItems(
           returnQty,
           fallbackUnitCost: oldItem.unitCostPrice,
           referenceId: sale.receiptNumber,
-          reason: cleanReason || `Tab edited on ${sale.receiptNumber}`,
+          reason: cleanReason || `Receipt edited on ${sale.receiptNumber}`,
           userId,
         });
 
@@ -883,7 +1107,7 @@ export async function updateCreditSaleItems(
       }
     }
 
-    // 3. Recompute sale totals & append compensating immutable ledger entry
+    // 3. Recompute sale totals
     const finalItems = await tx.saleItem.findMany({ where: { saleId: sale.id } });
     let newSubtotal = new Decimal(0);
     let newTotalCost = new Decimal(0);
@@ -892,78 +1116,326 @@ export async function updateCreditSaleItems(
       newTotalCost = addMoney(newTotalCost, item.lineCost);
     }
 
-    const newDiscount =
-      mergedNewMap.size === 0
-        ? new Decimal(0)
-        : toDecimal(input.discountAmount !== undefined ? input.discountAmount : sale.discountAmount);
+    const isVoided = mergedNewMap.size === 0;
+    const newDiscount = isVoided
+      ? new Decimal(0)
+      : toDecimal(input.discountAmount !== undefined ? input.discountAmount : sale.discountAmount);
     if (newDiscount.lt(0)) throw new ValidationError('Discount cannot be negative');
     if (newDiscount.gt(newSubtotal)) {
       throw new ValidationError('Discount amount cannot exceed updated subtotal');
     }
 
     const newTotal = subMoney(newSubtotal, newDiscount);
-    if (newTotal.lt(oldAmountPaid)) {
-      throw new ValidationError(
-        `Updated total (KSh ${newTotal.toFixed(2)}) cannot be less than already paid amount (KSh ${oldAmountPaid.toFixed(2)}). Use Debt Adjustment or Reversal instead.`
-      );
-    }
-
-    const newOutstanding = subMoney(newTotal, oldAmountPaid);
     const newGrossProfit = subMoney(newTotal, newTotalCost);
-    const debtDelta = subMoney(newOutstanding, oldOutstanding);
-    const purchasesDelta = subMoney(newTotal, oldTotal);
 
-    if (debtDelta.gt(0)) {
-      const currentBal = toDecimal(lockedAccount.current_balance);
-      const creditLimit = toDecimal(lockedAccount.credit_limit);
-      const projectedBal = addMoney(currentBal, debtDelta);
-      if (projectedBal.gt(creditLimit) && !input.allowCreditLimitOverride) {
-        throw new ValidationError(
-          `Credit limit exceeded for ${sale.customer.fullName}. Current debt: KSh ${currentBal.toFixed(
-            2
-          )}, Limit: KSh ${creditLimit.toFixed(2)}, Projected: KSh ${projectedBal.toFixed(2)}`
-        );
+    const isMultiShare = (sale.shares?.length ?? 0) > 1;
+
+    let newCash = new Decimal(0);
+    let newMpesa = new Decimal(0);
+    let newAmountPaid = new Decimal(0);
+    let newOutstanding = new Decimal(0);
+    let newPaymentMethod: SalePaymentMethod = sale.paymentMethod;
+    let updatedCustomerId: string | null = sale.customerId;
+    let primaryNewCustomerBalance = 0;
+
+    if (isMultiShare) {
+      // Multi-person split receipt editing
+      type CustStat = { debt: Decimal; paid: Decimal; total: Decimal };
+      const oldStatsByCust = new Map<string, CustStat>();
+      for (const sh of sale.shares) {
+        if (!sh.customerId) continue;
+        const cur = oldStatsByCust.get(sh.customerId) ?? {
+          debt: new Decimal(0),
+          paid: new Decimal(0),
+          total: new Decimal(0),
+        };
+        cur.debt = addMoney(cur.debt, sh.debtAmount);
+        cur.paid = addMoney(cur.paid, sh.paidAmount);
+        cur.total = addMoney(cur.total, sh.shareTotal);
+        oldStatsByCust.set(sh.customerId, cur);
+      }
+
+      const newStatsByCust = new Map<string, CustStat>();
+
+      if (isVoided) {
+        await tx.saleShare.updateMany({
+          where: { saleId: sale.id },
+          data: {
+            shareTotal: '0.00',
+            cashAmount: '0.00',
+            mpesaAmount: '0.00',
+            paidAmount: '0.00',
+            debtAmount: '0.00',
+          },
+        });
+        await replaceSalePosPaymentsTx(tx, {
+          saleId: sale.id,
+          receiptNumber: sale.receiptNumber,
+          userId,
+          mpesaReference: cleanMpesaRef,
+          entries: [],
+        });
+
+        const sortedOldCustIds = Array.from(oldStatsByCust.keys()).sort();
+        for (const cid of sortedOldCustIds) {
+          const oldS = oldStatsByCust.get(cid)!;
+          const bal = await applyCustomerEditDeltaTx(tx, {
+            customerId: cid,
+            saleId: sale.id,
+            receiptNumber: sale.receiptNumber,
+            debtDelta: oldS.debt.negated(),
+            purchasesDelta: oldS.total.negated(),
+            paidDelta: oldS.paid.negated(),
+            isVoided: true,
+            cleanNote,
+            cleanReason,
+            userId,
+          });
+          if (cid === sale.customerId) primaryNewCustomerBalance = bal.toNumber();
+        }
+      } else {
+        if (!input.splitShares || input.splitShares.length < 2) {
+          throw new ValidationError(
+            'Multi-person split receipts require updated splitShares summing to the new total'
+          );
+        }
+        const validatedShares = normalizeAndValidateSplitShares(input.splitShares, newTotal);
+        newCash = validatedShares.totalCash;
+        newMpesa = validatedShares.totalMpesa;
+        newAmountPaid = validatedShares.totalPaid;
+        newOutstanding = validatedShares.totalDebt;
+        newPaymentMethod = 'SPLIT';
+
+        for (const sh of validatedShares.shares) {
+          if (!sh.customerId) continue;
+          const cur = newStatsByCust.get(sh.customerId) ?? {
+            debt: new Decimal(0),
+            paid: new Decimal(0),
+            total: new Decimal(0),
+          };
+          cur.debt = addMoney(cur.debt, sh.debtAmount);
+          cur.paid = addMoney(cur.paid, sh.paidAmount);
+          cur.total = addMoney(cur.total, sh.shareTotal);
+          newStatsByCust.set(sh.customerId, cur);
+        }
+
+        const allCustIds = Array.from(
+          new Set([...oldStatsByCust.keys(), ...newStatsByCust.keys()])
+        ).sort();
+        const custRows = allCustIds.length
+          ? await tx.customer.findMany({
+              where: { id: { in: allCustIds } },
+              select: { id: true, fullName: true, status: true },
+            })
+          : [];
+        const custNameMap = new Map(custRows.map((c) => [c.id, c]));
+        for (const cid of allCustIds) {
+          if (!custNameMap.has(cid)) throw new NotFoundError('Selected customer not found');
+        }
+
+        for (const cid of allCustIds) {
+          const oldS = oldStatsByCust.get(cid) ?? {
+            debt: new Decimal(0),
+            paid: new Decimal(0),
+            total: new Decimal(0),
+          };
+          const newS = newStatsByCust.get(cid) ?? {
+            debt: new Decimal(0),
+            paid: new Decimal(0),
+            total: new Decimal(0),
+          };
+          const debtDelta = subMoney(newS.debt, oldS.debt);
+          const lockedAccount = await lockCustomerAccountTx(tx, cid);
+          if (debtDelta.gt(0)) {
+            const custInfo = custNameMap.get(cid)!;
+            if (custInfo.status !== 'ACTIVE') {
+              throw new ValidationError(
+                `Customer ${custInfo.fullName} is ${custInfo.status.toLowerCase()} and cannot make credit purchases`
+              );
+            }
+            const currentBal = toDecimal(lockedAccount.current_balance);
+            const creditLimit = toDecimal(lockedAccount.credit_limit);
+            const projectedBal = addMoney(currentBal, debtDelta);
+            if (projectedBal.gt(creditLimit) && !input.allowCreditLimitOverride) {
+              throw new ValidationError(
+                `Credit limit exceeded for ${custInfo.fullName}. Current debt: KSh ${currentBal.toFixed(
+                  2
+                )}, Limit: KSh ${creditLimit.toFixed(2)}, Projected: KSh ${projectedBal.toFixed(2)}`
+              );
+            }
+          }
+        }
+
+        await tx.saleShare.deleteMany({ where: { saleId: sale.id } });
+        const paymentEntries: Array<{
+          customerId: string | null;
+          cashAmount: Decimal;
+          mpesaAmount: Decimal;
+          label: string;
+        }> = [];
+
+        for (let i = 0; i < validatedShares.shares.length; i += 1) {
+          const sh = validatedShares.shares[i];
+          const label =
+            (sh.customerId ? custNameMap.get(sh.customerId)?.fullName : null) ||
+            sh.payerName ||
+            `Person ${i + 1}`;
+          await tx.saleShare.create({
+            data: {
+              saleId: sale.id,
+              customerId: sh.customerId,
+              payerName: label,
+              shareTotal: sh.shareTotal.toFixed(2),
+              cashAmount: sh.cashAmount.toFixed(2),
+              mpesaAmount: sh.mpesaAmount.toFixed(2),
+              paidAmount: sh.paidAmount.toFixed(2),
+              debtAmount: sh.debtAmount.toFixed(2),
+              notes: sh.notes,
+            },
+          });
+          paymentEntries.push({
+            customerId: sh.customerId,
+            cashAmount: sh.cashAmount,
+            mpesaAmount: sh.mpesaAmount,
+            label,
+          });
+        }
+
+        await replaceSalePosPaymentsTx(tx, {
+          saleId: sale.id,
+          receiptNumber: sale.receiptNumber,
+          userId,
+          mpesaReference: cleanMpesaRef,
+          entries: paymentEntries,
+        });
+
+        for (const cid of allCustIds) {
+          const oldS = oldStatsByCust.get(cid) ?? {
+            debt: new Decimal(0),
+            paid: new Decimal(0),
+            total: new Decimal(0),
+          };
+          const newS = newStatsByCust.get(cid) ?? {
+            debt: new Decimal(0),
+            paid: new Decimal(0),
+            total: new Decimal(0),
+          };
+          const bal = await applyCustomerEditDeltaTx(tx, {
+            customerId: cid,
+            saleId: sale.id,
+            receiptNumber: sale.receiptNumber,
+            debtDelta: subMoney(newS.debt, oldS.debt),
+            purchasesDelta: subMoney(newS.total, oldS.total),
+            paidDelta: subMoney(newS.paid, oldS.paid),
+            isVoided: false,
+            cleanNote,
+            cleanReason,
+            userId,
+          });
+          if (cid === sale.customerId || primaryNewCustomerBalance === 0) {
+            primaryNewCustomerBalance = bal.toNumber();
+          }
+        }
+
+        const firstDebtor = validatedShares.shares.find((s) => s.customerId && s.debtAmount.gt(0));
+        const firstLinked = validatedShares.shares.find((s) => s.customerId);
+        if (!updatedCustomerId || !newStatsByCust.has(updatedCustomerId)) {
+          updatedCustomerId = firstDebtor?.customerId ?? firstLinked?.customerId ?? null;
+        }
+      }
+    } else {
+      // Single-customer OR Walk-in sale (0 or 1 share)
+      const resolvedPay = resolveUpdatedSingleSalePayments({
+        newTotal,
+        oldCash,
+        oldMpesa,
+        oldPaymentMethod: sale.paymentMethod,
+        isVoided,
+        hasCustomer: Boolean(sale.customerId),
+        explicitCash: input.cashAmount,
+        explicitMpesa: input.mpesaAmount,
+      });
+
+      newCash = resolvedPay.cashAmount;
+      newMpesa = resolvedPay.mpesaAmount;
+      newAmountPaid = resolvedPay.amountPaid;
+      newOutstanding = resolvedPay.outstandingAmount;
+      newPaymentMethod = resolvedPay.paymentMethod;
+
+      if (sale.customerId && sale.customer) {
+        const lockedAccount = await lockCustomerAccountTx(tx, sale.customerId);
+        const debtDelta = subMoney(newOutstanding, oldOutstanding);
+        const purchasesDelta = subMoney(newTotal, oldTotal);
+        const paidDelta = subMoney(newAmountPaid, oldAmountPaid);
+
+        if (debtDelta.gt(0)) {
+          if (sale.customer.status !== 'ACTIVE') {
+            throw new ValidationError(
+              `Customer ${sale.customer.fullName} is ${sale.customer.status.toLowerCase()} and cannot make credit purchases`
+            );
+          }
+          const currentBal = toDecimal(lockedAccount.current_balance);
+          const creditLimit = toDecimal(lockedAccount.credit_limit);
+          const projectedBal = addMoney(currentBal, debtDelta);
+          if (projectedBal.gt(creditLimit) && !input.allowCreditLimitOverride) {
+            throw new ValidationError(
+              `Credit limit exceeded for ${sale.customer.fullName}. Current debt: KSh ${currentBal.toFixed(
+                2
+              )}, Limit: KSh ${creditLimit.toFixed(2)}, Projected: KSh ${projectedBal.toFixed(2)}`
+            );
+          }
+        }
+
+        const newBal = await applyCustomerEditDeltaTx(tx, {
+          customerId: sale.customerId,
+          saleId: sale.id,
+          receiptNumber: sale.receiptNumber,
+          debtDelta,
+          purchasesDelta,
+          paidDelta,
+          isVoided,
+          cleanNote,
+          cleanReason,
+          userId,
+        });
+        primaryNewCustomerBalance = newBal.toNumber();
+      }
+
+      if (!newCash.eq(oldCash) || !newMpesa.eq(oldMpesa) || isVoided) {
+        await replaceSalePosPaymentsTx(tx, {
+          saleId: sale.id,
+          receiptNumber: sale.receiptNumber,
+          userId,
+          mpesaReference: cleanMpesaRef,
+          entries: isVoided
+            ? []
+            : [{ customerId: sale.customerId, cashAmount: newCash, mpesaAmount: newMpesa }],
+        });
       }
     }
 
     await tx.sale.update({
       where: { id: sale.id },
       data: {
+        customerId: updatedCustomerId,
         subtotal: newSubtotal.toFixed(2),
         discountAmount: newDiscount.toFixed(2),
-        ...(input.discountReason !== undefined ? { discountReason: input.discountReason?.trim() || null } : {}),
+        ...(input.discountReason !== undefined
+          ? { discountReason: input.discountReason?.trim() || null }
+          : {}),
         totalAmount: newTotal.toFixed(2),
+        cashAmount: newCash.toFixed(2),
+        mpesaAmount: newMpesa.toFixed(2),
+        mpesaReference: cleanMpesaRef,
+        amountPaid: newAmountPaid.toFixed(2),
         outstandingAmount: newOutstanding.toFixed(2),
         totalCost: newTotalCost.toFixed(2),
         grossProfit: newGrossProfit.toFixed(2),
+        paymentMethod: newPaymentMethod,
         notes: cleanNote,
-        status: mergedNewMap.size === 0 ? 'VOIDED' : 'COMPLETED',
+        status: isVoided ? 'VOIDED' : 'COMPLETED',
       },
     });
-
-    let newCustomerBalance = toDecimal(lockedAccount.current_balance);
-    if (!debtDelta.isZero()) {
-      const isIncrease = debtDelta.gt(0);
-      const ledgerRes = await appendLedgerEntryTx(tx, {
-        customerId: sale.customerId,
-        transactionType: isIncrease ? 'ADJUSTMENT_DEBIT' : 'ADJUSTMENT_CREDIT',
-        direction: isIncrease ? 'DEBIT' : 'CREDIT',
-        amount: debtDelta.abs(),
-        description:
-          mergedNewMap.size === 0
-            ? `Voided/removed all drinks on ${sale.receiptNumber}${cleanNote ? ` — ${cleanNote}` : ''}`
-            : `Updated drinks on ${sale.receiptNumber} (${
-                isIncrease ? '+' : '-'
-              }KSh ${debtDelta.abs().toFixed(2)})${cleanNote ? ` — ${cleanNote}` : ''}`,
-        reason: cleanReason || 'Customer drink tab updated',
-        saleId: sale.id,
-        userId,
-        accountStatsIncrement: !purchasesDelta.isZero()
-          ? { totalPurchases: purchasesDelta.toNumber() }
-          : undefined,
-      });
-      newCustomerBalance = ledgerRes.newBalance;
-    }
 
     await recordAuditLog(tx, {
       actorType: 'OWNER',
@@ -976,8 +1448,10 @@ export async function updateCreditSaleItems(
         receiptNumber: sale.receiptNumber,
         oldTotal: oldTotal.toNumber(),
         newTotal: newTotal.toNumber(),
-        debtDelta: debtDelta.toNumber(),
-        voided: mergedNewMap.size === 0,
+        debtDelta: subMoney(newOutstanding, oldOutstanding).toNumber(),
+        isMultiShare,
+        walkIn: !sale.customerId && !isMultiShare,
+        voided: isVoided,
       },
       ipAddress,
     });
@@ -988,14 +1462,20 @@ export async function updateCreditSaleItems(
         customer: { select: { id: true, fullName: true, accountNumber: true, phone: true } },
         items: true,
         payments: true,
+        shares: {
+          include: { customer: { select: { id: true, fullName: true, accountNumber: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
 
-    return { sale: formatSale(refreshed), newCustomerBalance: newCustomerBalance.toNumber() };
+    return { sale: formatSale(refreshed), newCustomerBalance: primaryNewCustomerBalance };
   });
 
   return updatedResult;
 }
+
+export const updateSaleItems = updateCreditSaleItems;
 
 export async function listSales(params?: {
   customerId?: string;
