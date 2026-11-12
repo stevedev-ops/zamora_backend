@@ -5,6 +5,7 @@ import * as reportService from '../services/report.service';
 import { getStoreSettings } from '../services/settings.service';
 import { generateFinancialReportPdf } from '../integrations/pdf';
 import { generateExcelWorkbook } from '../integrations/excel';
+import { sendTableExport } from '../integrations/export';
 
 const router = Router();
 router.use(requireOwner);
@@ -202,6 +203,107 @@ router.get(
     );
     res.setHeader('Content-Disposition', 'attachment; filename="zamora-financial-report.xlsx"');
     res.send(buffer);
+  })
+);
+
+router.get(
+  '/export/csv',
+  asyncHandler(async (req, res) => {
+    const reportType = (req.query.type as string) || 'pnl';
+    const [report, settings] = await Promise.all([
+      reportService.getFinancialAnalyticsReport({
+        preset: req.query.preset as reportService.DatePreset | undefined,
+        startDate: req.query.startDate as string | undefined,
+        endDate: req.query.endDate as string | undefined,
+      }),
+      getStoreSettings(),
+    ]);
+
+    const cur = settings.currency || 'KSh';
+
+    if (reportType === 'debt') {
+      await sendTableExport(res, {
+        format: 'csv',
+        filenameBase: 'zamora-debt-report',
+        title: 'Customer Debt Report',
+        columns: [
+          { header: 'Account #', key: 'accountNumber' },
+          { header: 'Customer', key: 'fullName' },
+          { header: 'Phone', key: 'phone' },
+          { header: `Current Debt (${cur})`, key: 'currentBalance', money: true },
+          { header: `Credit Limit (${cur})`, key: 'creditLimit', money: true },
+        ],
+        rows: report.customerDebtReport.rows,
+        store: settings,
+      });
+      return;
+    }
+
+    if (reportType === 'stock') {
+      await sendTableExport(res, {
+        format: 'csv',
+        filenameBase: 'zamora-stock-valuation',
+        title: 'Stock Valuation Report',
+        columns: [
+          { header: 'Category', key: 'category' },
+          { header: 'Units', key: 'units' },
+          { header: `Cost Value (${cur})`, key: 'costValue', money: true },
+          { header: `Retail Value (${cur})`, key: 'retailValue', money: true },
+        ],
+        rows: report.stockValuationReport.byCategory,
+        store: settings,
+      });
+      return;
+    }
+
+    if (reportType === 'products') {
+      await sendTableExport(res, {
+        format: 'csv',
+        filenameBase: 'zamora-product-profitability',
+        title: 'Product Profitability Report',
+        columns: [
+          { header: 'Product', key: 'productName' },
+          { header: 'Brand', key: 'brand' },
+          { header: 'Size', key: 'bottleSize' },
+          { header: 'Units Sold', key: 'unitsSold' },
+          { header: `Revenue (${cur})`, key: 'totalRevenue', money: true },
+          { header: `COGS (${cur})`, key: 'cogs', money: true },
+          { header: `Gross Profit (${cur})`, key: 'grossProfit', money: true },
+          { header: 'Margin %', key: 'profitMarginPercent' },
+        ],
+        rows: report.productProfitability,
+        store: settings,
+      });
+      return;
+    }
+
+    const pnl = report.profitAndLoss;
+    await sendTableExport(res, {
+      format: 'csv',
+      filenameBase: 'zamora-pnl-report',
+      title: 'Profit & Loss Report',
+      columns: [
+        { header: 'Metric', key: 'metric' },
+        { header: `Value (${cur})`, key: 'amount' },
+      ],
+      rows: [
+        { metric: 'Period', amount: report.period.label },
+        { metric: 'Net Sales Revenue', amount: pnl.netSalesRevenue },
+        { metric: 'Cost of Goods Sold (FIFO)', amount: pnl.costOfGoodsSold },
+        { metric: 'Gross Profit', amount: pnl.grossProfit },
+        { metric: 'Operating Expenses', amount: pnl.totalOperatingExpenses },
+        { metric: 'Net Operating Profit', amount: pnl.netOperatingProfit },
+        { metric: 'POS Cash & M-Pesa Collected', amount: pnl.cashVsCredit.posTotalCollected },
+        { metric: 'Customer Debt Repayments', amount: pnl.cashVsCredit.totalDebtRepayments },
+        { metric: 'Total Actual Cash Collected', amount: pnl.cashVsCredit.totalActualCashCollected },
+        { metric: 'Credit Sales Issued', amount: pnl.cashVsCredit.creditSalesIssued },
+        {
+          metric: 'Total Outstanding Customer Debt',
+          amount: pnl.cashVsCredit.totalOutstandingCustomerDebt,
+        },
+      ],
+      store: settings,
+    });
   })
 );
 

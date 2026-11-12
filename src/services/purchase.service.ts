@@ -3,6 +3,7 @@ import { addMoney, mulMoney, toDecimal, toNumber } from '../lib/money';
 import { nextSequenceNumber } from '../lib/sequences';
 import { NotFoundError, ValidationError } from '../lib/errors';
 import { recordAuditLog } from '../lib/audit';
+import { buildDateRangeFilter } from '../lib/dateFilter';
 import { addStockBatchTx } from './inventory.service';
 import Decimal from 'decimal.js';
 
@@ -10,16 +11,21 @@ export async function listSupplierPurchases(params?: {
   supplierId?: string;
   startDate?: string;
   endDate?: string;
+  search?: string;
 }) {
+  const search = params?.search?.trim();
+  const purchaseDateFilter = buildDateRangeFilter(params?.startDate, params?.endDate);
   const purchases = await prisma.supplierPurchase.findMany({
     where: {
       ...(params?.supplierId ? { supplierId: params.supplierId } : {}),
-      ...(params?.startDate || params?.endDate
+      ...(purchaseDateFilter ? { purchaseDate: purchaseDateFilter } : {}),
+      ...(search
         ? {
-            purchaseDate: {
-              ...(params.startDate ? { gte: new Date(params.startDate) } : {}),
-              ...(params.endDate ? { lte: new Date(params.endDate) } : {}),
-            },
+            OR: [
+              { referenceNumber: { contains: search, mode: 'insensitive' } },
+              { notes: { contains: search, mode: 'insensitive' } },
+              { supplier: { name: { contains: search, mode: 'insensitive' } } },
+            ],
           }
         : {}),
     },

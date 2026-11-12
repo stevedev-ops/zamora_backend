@@ -5,6 +5,7 @@ import { addMoney, mulMoney, subMoney, toDecimal, toFixed2, toNumber } from '../
 import { nextSequenceNumber } from '../lib/sequences';
 import { NotFoundError, ValidationError } from '../lib/errors';
 import { recordAuditLog } from '../lib/audit';
+import { buildDateRangeFilter } from '../lib/dateFilter';
 import { allocateFifoBatchesTx, restoreBatchAllocationsTx } from './inventory.service';
 import { appendLedgerEntryTx, lockCustomerAccountTx } from './debt.service';
 import { notifyCustomerDebtEvent } from '../integrations/notifications';
@@ -693,18 +694,12 @@ export async function listSales(params?: {
   limit?: number;
 }) {
   const search = params?.search?.trim();
+  const soldAtFilter = buildDateRangeFilter(params?.startDate, params?.endDate);
   const sales = await prisma.sale.findMany({
     where: {
       ...(params?.customerId ? { customerId: params.customerId } : {}),
       ...(params?.paymentMethod ? { paymentMethod: params.paymentMethod } : {}),
-      ...(params?.startDate || params?.endDate
-        ? {
-            soldAt: {
-              ...(params.startDate ? { gte: new Date(params.startDate) } : {}),
-              ...(params.endDate ? { lte: new Date(params.endDate) } : {}),
-            },
-          }
-        : {}),
+      ...(soldAtFilter ? { soldAt: soldAtFilter } : {}),
       ...(search
         ? {
             OR: [

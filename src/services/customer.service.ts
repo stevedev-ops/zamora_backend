@@ -13,10 +13,28 @@ import {
   ensureActiveCustomerPortalLink,
 } from '../integrations/notifications';
 
+export type AgingFilterBucket = 'ALL' | '0_7' | '8_30' | '30_PLUS';
+
+export function getCustomerAgingDays(
+  lastTransactionAt: Date | string | null | undefined,
+  registeredAt: Date | string
+): number {
+  const ref = lastTransactionAt || registeredAt;
+  const diffMs = Date.now() - new Date(ref).getTime();
+  return Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+}
+
+export function getCustomerAgingBucket(days: number): '0_7' | '8_30' | '30_PLUS' {
+  if (days <= 7) return '0_7';
+  if (days <= 30) return '8_30';
+  return '30_PLUS';
+}
+
 export async function listCustomers(params?: {
   search?: string;
   status?: CustomerStatus;
   hasDebt?: boolean;
+  aging?: AgingFilterBucket;
 }) {
   const search = params?.search?.trim();
   const normalizedPhone = search ? normalizePhone(search) : undefined;
@@ -47,26 +65,38 @@ export async function listCustomers(params?: {
     orderBy: { fullName: 'asc' },
   });
 
-  return customers.map((c) => ({
-    id: c.id,
-    accountNumber: c.accountNumber,
-    fullName: c.fullName,
-    phone: c.phone,
-    email: c.email,
-    status: c.status,
-    notes: c.notes,
-    registeredAt: c.registeredAt,
-    currentDebt: toNumber(c.account?.currentBalance ?? 0),
-    creditLimit: toNumber(c.account?.creditLimit ?? 0),
-    totalPurchases: toNumber(c.account?.totalPurchases ?? 0),
-    totalPayments: toNumber(c.account?.totalPayments ?? 0),
-    totalTransferredIn: toNumber(c.account?.totalTransferredIn ?? 0),
-    totalTransferredOut: toNumber(c.account?.totalTransferredOut ?? 0),
-    lastTransactionAt: c.account?.lastTransactionAt ?? null,
-    portalUrl: c.portalTokens[0]
-      ? `${env.publicPortalBaseUrl}/${c.portalTokens[0].token}`
-      : null,
-  }));
+  const rows = customers.map((c) => {
+    const lastTx = c.account?.lastTransactionAt ?? null;
+    const agingDays = getCustomerAgingDays(lastTx, c.registeredAt);
+    const agingBucket = getCustomerAgingBucket(agingDays);
+    return {
+      id: c.id,
+      accountNumber: c.accountNumber,
+      fullName: c.fullName,
+      phone: c.phone,
+      email: c.email,
+      status: c.status,
+      notes: c.notes,
+      registeredAt: c.registeredAt,
+      currentDebt: toNumber(c.account?.currentBalance ?? 0),
+      creditLimit: toNumber(c.account?.creditLimit ?? 0),
+      totalPurchases: toNumber(c.account?.totalPurchases ?? 0),
+      totalPayments: toNumber(c.account?.totalPayments ?? 0),
+      totalTransferredIn: toNumber(c.account?.totalTransferredIn ?? 0),
+      totalTransferredOut: toNumber(c.account?.totalTransferredOut ?? 0),
+      lastTransactionAt: lastTx,
+      agingDays,
+      agingBucket,
+      portalUrl: c.portalTokens[0]
+        ? `${env.publicPortalBaseUrl}/${c.portalTokens[0].token}`
+        : null,
+    };
+  });
+
+  if (params?.aging && params.aging !== 'ALL') {
+    return rows.filter((r) => r.agingBucket === params.aging);
+  }
+  return rows;
 }
 
 export async function getCustomerProfile(id: string) {

@@ -4,21 +4,28 @@ import { toDecimal, toNumber } from '../lib/money';
 import { nextSequenceNumber } from '../lib/sequences';
 import { NotFoundError, ValidationError } from '../lib/errors';
 import { recordAuditLog } from '../lib/audit';
+import { buildDateRangeFilter } from '../lib/dateFilter';
 
 export async function listExpenses(params?: {
   category?: ExpenseCategory;
   startDate?: string;
   endDate?: string;
+  search?: string;
 }) {
+  const search = params?.search?.trim();
+  const expenseDateFilter = buildDateRangeFilter(params?.startDate, params?.endDate);
   const expenses = await prisma.expense.findMany({
     where: {
       ...(params?.category ? { category: params.category } : {}),
-      ...(params?.startDate || params?.endDate
+      ...(expenseDateFilter ? { expenseDate: expenseDateFilter } : {}),
+      ...(search
         ? {
-            expenseDate: {
-              ...(params.startDate ? { gte: new Date(params.startDate) } : {}),
-              ...(params.endDate ? { lte: new Date(params.endDate) } : {}),
-            },
+            OR: [
+              { title: { contains: search, mode: 'insensitive' } },
+              { payee: { contains: search, mode: 'insensitive' } },
+              { referenceNumber: { contains: search, mode: 'insensitive' } },
+              { notes: { contains: search, mode: 'insensitive' } },
+            ],
           }
         : {}),
     },

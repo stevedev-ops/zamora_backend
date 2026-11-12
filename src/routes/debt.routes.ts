@@ -8,6 +8,12 @@ import { validateBody } from '../middleware/validate';
 import * as debtService from '../services/debt.service';
 import { getStoreSettings } from '../services/settings.service';
 import { generatePaymentReceiptPdf } from '../integrations/pdf';
+import {
+  exportFmtDateTime,
+  exportFmtMoney,
+  parseExportFormat,
+  sendTableExport,
+} from '../integrations/export';
 
 const router = Router();
 router.use(requireOwner);
@@ -58,9 +64,191 @@ router.get(
       transactionType: req.query.transactionType as DebtTransactionType | undefined,
       startDate: req.query.startDate as string | undefined,
       endDate: req.query.endDate as string | undefined,
+      search: req.query.search as string | undefined,
       limit: req.query.limit ? Number(req.query.limit) : undefined,
     });
     res.json({ transactions });
+  })
+);
+
+router.get(
+  '/transactions/export/:format',
+  asyncHandler(async (req, res) => {
+    const format = parseExportFormat(req.params.format as string);
+    const customerId = req.query.customerId as string | undefined;
+    const transactionType = req.query.transactionType as DebtTransactionType | undefined;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const search = (req.query.search as string | undefined)?.trim();
+
+    const [transactions, settings] = await Promise.all([
+      debtService.listDebtTransactions({
+        customerId,
+        transactionType,
+        startDate,
+        endDate,
+        search,
+        limit: 5000,
+      }),
+      getStoreSettings(),
+    ]);
+
+    const cur = settings.currency || 'KSh';
+    const totalDebits = transactions
+      .filter((t) => t.direction === 'DEBIT')
+      .reduce((s, t) => s + t.amount, 0);
+    const totalCredits = transactions
+      .filter((t) => t.direction === 'CREDIT')
+      .reduce((s, t) => s + t.amount, 0);
+
+    const filterParts = [
+      ...(customerId ? [`Customer ID: ${customerId}`] : ['All Customers']),
+      ...(transactionType ? [`Type: ${transactionType}`] : []),
+      ...(startDate ? [`From: ${startDate}`] : []),
+      ...(endDate ? [`To: ${endDate}`] : []),
+      ...(search ? [`Search: "${search}"`] : []),
+    ];
+
+    await sendTableExport(res, {
+      format,
+      filenameBase: 'zamora-debt-ledger',
+      title: 'Debt Ledger Transactions',
+      filterSummary: filterParts.join(' | '),
+      summaryRows: [
+        { label: 'Transactions Count', value: String(transactions.length) },
+        { label: 'Total Debits (+)', value: exportFmtMoney(cur, totalDebits) },
+        { label: 'Total Credits (-)', value: exportFmtMoney(cur, totalCredits) },
+      ],
+      columns: [
+        {
+          header: 'Date',
+          key: 'createdAt',
+          width: 17,
+          format: (r) => exportFmtDateTime(r.createdAt),
+        },
+        { header: 'Ref #', key: 'referenceNumber', width: 14 },
+        {
+          header: 'Customer',
+          key: 'customerName',
+          width: 20,
+          format: (r) => `${r.customer.fullName} (${r.customer.accountNumber})`,
+        },
+        { header: 'Type', key: 'transactionType', width: 16 },
+        { header: 'Dir', key: 'direction', width: 9 },
+        { header: 'Description', key: 'description', width: 28 },
+        { header: `Amount (${cur})`, key: 'amount', width: 14, align: 'right', money: true },
+        {
+          header: `Balance (${cur})`,
+          key: 'runningBalance',
+          width: 14,
+          align: 'right',
+          money: true,
+        },
+      ],
+      rows: transactions,
+      store: settings,
+    });
+  })
+);
+
+router.get(
+  '/transfers/export/:format',
+  asyncHandler(async (req, res) => {
+    const format = parseExportFormat(req.params.format as string);
+    const customerId = req.query.customerId as string | undefined;
+    const status = req.query.status as string | undefined;
+
+    const [transfers, settings] = await Promise.all([
+      debtService.listDebtTransfers({ customerId, status }),
+      getStoreSettings(),
+    ]);
+
+    const cur = settings.currency || 'KSh';
+    const totalAmount = transfers.reduce((s, t) => s + t.amount, 0);
+    const filterParts = [
+      ...(customerId ? [`Customer ID: ${customerId}`] : ['All Customers']),
+      ...(status ? [`Status: ${status}`] : []),
+    ];
+
+    await sendTableExport(res, {
+      format,
+      filenameBase: 'zamora-debt-transfers',
+      title: 'Debt Transfers Log',
+      filterSummary: filterParts.join(' | '),
+      summaryRows: [
+        { label: 'Transfers Count', value: String(transfers.length) },
+        { label: 'Total Transfer Volume', value: exportFmtMoney(cur, totalAmount) },
+      ],
+      columns: [
+        {
+          header: 'Date',
+          key: 'createdAt',
+          width: 17,
+          format: (r) => exportFmtDateTime(r.createdAt),
+        },
+        { header: 'Ref #', key: 'referenceNumber', width: 14 },
+        {
+          header: 'From Customer',
+          key: 'fromName',
+          width: 20,
+          format: (r) => `${r.fromCustomer.fullName} (${r.fromCustomer.accountNumber})`,
+        },
+        {
+          header: 'To Customer',
+          key: 'toName',
+          width: 20,
+          format: (r) => `${r.toCustomer.fullName} (${r.toCustomer.accountNumber})`,
+        },
+        { header: `Amount (${cur})`, key: 'amount', width: 14, align: 'right', money: true },
+        { header: 'Status', key: 'status', width: 16 },
+        { header: 'Reason', key: 'reason', width: 26 },
+      ],
+      rows: transfers,
+      store: settings,
+    });
+  })
+);
+
+router.get(
+  '/clarifications/export/:format',
+  asyncHandler(async (req, res) => {
+    const format = parseExportFormat(req.params.format as string);
+    const [requests, settings] = await Promise.all([
+      debtService.listClarificationRequests(),
+      getStoreSettings(),
+    ]);
+
+    await sendTableExport(res, {
+      format,
+      filenameBase: 'zamora-debt-clarifications',
+      title: 'Customer Clarification Requests',
+      summaryRows: [
+        { label: 'Total Requests', value: String(requests.length) },
+        {
+          label: 'Open Requests',
+          value: String(requests.filter((r) => r.status === 'OPEN').length),
+        },
+      ],
+      columns: [
+        {
+          header: 'Date',
+          key: 'createdAt',
+          width: 17,
+          format: (r) => exportFmtDateTime(r.createdAt),
+        },
+        {
+          header: 'Customer',
+          key: 'customerName',
+          width: 20,
+          format: (r) => `${r.customer.fullName} (${r.customer.accountNumber})`,
+        },
+        { header: 'Status', key: 'status', width: 12 },
+        { header: 'Message', key: 'message', width: 32 },
+        { header: 'Owner Response', key: 'ownerResponse', width: 30 },
+      ],
+      rows: requests,
+      store: settings,
+    });
   })
 );
 

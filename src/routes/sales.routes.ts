@@ -7,6 +7,12 @@ import { validateBody } from '../middleware/validate';
 import * as posService from '../services/pos.service';
 import { getStoreSettings } from '../services/settings.service';
 import { generateSaleReceiptPdf } from '../integrations/pdf';
+import {
+  exportFmtDateTime,
+  exportFmtMoney,
+  parseExportFormat,
+  sendTableExport,
+} from '../integrations/export';
 
 const router = Router();
 router.use(requireOwner);
@@ -58,6 +64,89 @@ router.get(
       limit: req.query.limit ? Number(req.query.limit) : undefined,
     });
     res.json({ sales });
+  })
+);
+
+router.get(
+  '/export/:format',
+  asyncHandler(async (req, res) => {
+    const format = parseExportFormat(req.params.format as string);
+    const customerId = req.query.customerId as string | undefined;
+    const paymentMethod = req.query.paymentMethod as SalePaymentMethod | undefined;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+    const search = (req.query.search as string | undefined)?.trim();
+
+    const [sales, settings] = await Promise.all([
+      posService.listSales({
+        customerId,
+        paymentMethod,
+        startDate,
+        endDate,
+        search,
+        limit: 5000,
+      }),
+      getStoreSettings(),
+    ]);
+
+    const cur = settings.currency || 'KSh';
+    const totalSales = sales.reduce((s, row) => s + row.totalAmount, 0);
+    const totalPaid = sales.reduce((s, row) => s + row.amountPaid, 0);
+    const totalOutstanding = sales.reduce((s, row) => s + row.outstandingAmount, 0);
+
+    const filterParts = [
+      ...(paymentMethod ? [`Method: ${paymentMethod}`] : []),
+      ...(startDate ? [`From: ${startDate}`] : []),
+      ...(endDate ? [`To: ${endDate}`] : []),
+      ...(search ? [`Search: "${search}"`] : []),
+    ];
+
+    await sendTableExport(res, {
+      format,
+      filenameBase: 'zamora-sales',
+      title: 'Sales Log',
+      filterSummary: filterParts.length > 0 ? filterParts.join(' | ') : 'Recent Sales',
+      summaryRows: [
+        { label: 'Sales Count', value: String(sales.length) },
+        { label: 'Total Billed', value: exportFmtMoney(cur, totalSales) },
+        { label: 'Total Paid', value: exportFmtMoney(cur, totalPaid) },
+        { label: 'Total Credit / Unpaid', value: exportFmtMoney(cur, totalOutstanding) },
+      ],
+      columns: [
+        { header: 'Receipt #', key: 'receiptNumber', width: 14 },
+        {
+          header: 'Date',
+          key: 'soldAt',
+          width: 17,
+          format: (r) => exportFmtDateTime(r.soldAt),
+        },
+        {
+          header: 'Customer',
+          key: 'customerName',
+          width: 20,
+          format: (r) => r.customer?.fullName || 'Walk-in',
+        },
+        { header: 'Method', key: 'paymentMethod', width: 10 },
+        {
+          header: 'Items',
+          key: 'itemsSummary',
+          width: 28,
+          format: (r) => r.items.map((i) => `${i.productName} x${i.quantity}`).join(', '),
+        },
+        { header: `Total (${cur})`, key: 'totalAmount', width: 13, align: 'right', money: true },
+        { header: `Paid (${cur})`, key: 'amountPaid', width: 13, align: 'right', money: true },
+        {
+          header: `Debt (${cur})`,
+          key: 'outstandingAmount',
+          width: 13,
+          align: 'right',
+          money: true,
+        },
+        { header: 'Status', key: 'status', width: 10 },
+      ],
+      rows: sales,
+      store: settings,
+    });
   })
 );
 

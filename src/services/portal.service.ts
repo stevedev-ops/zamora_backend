@@ -209,6 +209,7 @@ export async function getCustomerPortalDashboard(
       receiptFooter: true,
       mpesaEnabled: true,
       mpesaPaybillOrTill: true,
+      mpesaAccountReference: true,
     },
   });
 
@@ -326,8 +327,10 @@ export async function getCustomerPortalDashboard(
       storePhone: settings?.storePhone || '',
       storeAddress: settings?.storeAddress || '',
       currency: settings?.currency || 'KSh',
+      receiptFooter: settings?.receiptFooter || '',
       mpesaEnabled: settings?.mpesaEnabled ?? true,
       mpesaPaybillOrTill: settings?.mpesaPaybillOrTill || null,
+      mpesaAccountReference: settings?.mpesaAccountReference || null,
     },
     customer: {
       accountNumber: customer.accountNumber,

@@ -6,6 +6,7 @@ import { toNumber } from '../lib/money';
 import { NotFoundError, ValidationError } from '../lib/errors';
 import { initiateDarajaStkPush } from '../integrations/daraja';
 import { recordDebtRepayment } from './debt.service';
+import { getStoreSettings } from './settings.service';
 
 export async function initiateMpesaStkPush(input: {
   purpose: MpesaPurpose;
@@ -23,6 +24,13 @@ export async function initiateMpesaStkPush(input: {
     const customer = await prisma.customer.findUnique({ where: { id: input.customerId } });
     if (!customer) throw new NotFoundError('Customer not found');
     accountReference = customer.accountNumber;
+  } else {
+    const settings = await getStoreSettings();
+    if (settings.mpesaAccountReference?.trim()) {
+      accountReference = settings.mpesaAccountReference.trim();
+    } else if (settings.mpesaPaybillOrTill?.trim()) {
+      accountReference = settings.mpesaPaybillOrTill.trim();
+    }
   }
 
   const stkResp = await initiateDarajaStkPush({

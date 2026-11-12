@@ -11,6 +11,7 @@ import { nextSequenceNumber } from '../lib/sequences';
 import { generateNumericOtp, generateSecureToken, hashToken } from '../lib/crypto';
 import { recordAuditLog } from '../lib/audit';
 import { ConflictError, NotFoundError, ValidationError } from '../lib/errors';
+import { buildDateRangeFilter } from '../lib/dateFilter';
 import { env } from '../config/env';
 import { dispatchNotification, notifyCustomerDebtEvent } from '../integrations/notifications';
 
@@ -788,18 +789,25 @@ export async function listDebtTransactions(params?: {
   transactionType?: DebtTransactionType;
   startDate?: string;
   endDate?: string;
+  search?: string;
   limit?: number;
 }) {
+  const search = params?.search?.trim();
+  const createdAtFilter = buildDateRangeFilter(params?.startDate, params?.endDate);
   const rows = await prisma.debtTransaction.findMany({
     where: {
       ...(params?.customerId ? { customerId: params.customerId } : {}),
       ...(params?.transactionType ? { transactionType: params.transactionType } : {}),
-      ...(params?.startDate || params?.endDate
+      ...(createdAtFilter ? { createdAt: createdAtFilter } : {}),
+      ...(search
         ? {
-            createdAt: {
-              ...(params.startDate ? { gte: new Date(params.startDate) } : {}),
-              ...(params.endDate ? { lte: new Date(params.endDate) } : {}),
-            },
+            OR: [
+              { referenceNumber: { contains: search, mode: 'insensitive' } },
+              { description: { contains: search, mode: 'insensitive' } },
+              { customer: { fullName: { contains: search, mode: 'insensitive' } } },
+              { customer: { accountNumber: { contains: search, mode: 'insensitive' } } },
+              { customer: { phone: { contains: search, mode: 'insensitive' } } },
+            ],
           }
         : {}),
     },

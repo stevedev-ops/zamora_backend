@@ -1,9 +1,16 @@
 import PDFDocument from 'pdfkit';
 import { MoneyInput, toNumber } from '../lib/money';
 
-function buildPdfBuffer(render: (doc: PDFKit.PDFDocument) => void): Promise<Buffer> {
+function buildPdfBuffer(
+  render: (doc: PDFKit.PDFDocument) => void,
+  options?: { layout?: 'portrait' | 'landscape' }
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 40, size: 'A4' });
+    const doc = new PDFDocument({
+      margin: 40,
+      size: 'A4',
+      layout: options?.layout ?? 'portrait',
+    });
     const chunks: Buffer[] = [];
     doc.on('data', (chunk: Buffer) => chunks.push(chunk));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
@@ -37,6 +44,16 @@ export interface StoreHeaderInfo {
   storeAddress: string;
   currency: string;
   receiptFooter: string;
+  mpesaEnabled?: boolean;
+  mpesaPaybillOrTill?: string | null;
+  mpesaAccountReference?: string | null;
+}
+
+function formatMpesaPayInfo(store: StoreHeaderInfo): string | null {
+  if (!store.mpesaEnabled || !store.mpesaPaybillOrTill) return null;
+  const label = store.mpesaAccountReference ? 'M-Pesa Paybill' : 'M-Pesa Till No.';
+  const acct = store.mpesaAccountReference ? ` | Account: ${store.mpesaAccountReference}` : '';
+  return `${label}: ${store.mpesaPaybillOrTill}${acct}`;
 }
 
 export async function generateSaleReceiptPdf(
@@ -168,7 +185,16 @@ export async function generateSaleReceiptPdf(
     }
 
     doc.moveDown(2);
-    doc.font('Helvetica').fontSize(9).fillColor('#475569').text(store.receiptFooter, 40, y + 20, {
+    const mpesaInfo = formatMpesaPayInfo(store);
+    let footerY = y + 20;
+    if (mpesaInfo) {
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('#0f172a').text(mpesaInfo, 40, footerY, {
+        align: 'center',
+        width: 515,
+      });
+      footerY += 16;
+    }
+    doc.font('Helvetica').fontSize(9).fillColor('#475569').text(store.receiptFooter, 40, footerY, {
       align: 'center',
       width: 515,
     });
@@ -223,6 +249,13 @@ export async function generatePaymentReceiptPdf(
     doc.text(`Remaining Outstanding Balance: ${fmtMoney(cur, customer.currentBalance)}`);
 
     doc.moveDown(2);
+    const mpesaInfo = formatMpesaPayInfo(store);
+    if (mpesaInfo) {
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('#0f172a').text(mpesaInfo, {
+        align: 'center',
+      });
+      doc.moveDown(0.3);
+    }
     doc.font('Helvetica').fontSize(9).fillColor('#475569').text(store.receiptFooter, {
       align: 'center',
     });
@@ -352,10 +385,149 @@ export async function generateCustomerStatementPdf(
     }
 
     doc.moveDown(1);
+    const mpesaInfo = formatMpesaPayInfo(store);
+    if (mpesaInfo) {
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('#0f172a').text(mpesaInfo, {
+        align: 'center',
+      });
+      doc.moveDown(0.3);
+    }
     doc.font('Helvetica').fontSize(9).fillColor('#475569').text(store.receiptFooter, {
       align: 'center',
     });
   });
+}
+
+export interface TabularPdfColumn {
+  header: string;
+  weight?: number;
+  align?: 'left' | 'right';
+}
+
+export async function generateTabularReportPdf(options: {
+  title: string;
+  subtitle?: string;
+  filterSummary?: string;
+  summaryRows: Array<{ label: string; value: string }>;
+  columns: TabularPdfColumn[];
+  rows: string[][];
+  store: StoreHeaderInfo;
+}): Promise<Buffer> {
+  const isLandscape = options.columns.length > 6;
+  const pageWidth = isLandscape ? 841.89 : 595.28;
+  const pageHeight = isLandscape ? 595.28 : 841.89;
+  const margin = 40;
+  const usableWidth = pageWidth - margin * 2;
+  const maxY = pageHeight - margin - 20;
+
+  return buildPdfBuffer(
+    (doc) => {
+      doc.fontSize(16).font('Helvetica-Bold').fillColor('#0f172a').text(options.store.storeName, {
+        align: 'center',
+      });
+      doc
+        .fontSize(8.5)
+        .font('Helvetica')
+        .fillColor('#475569')
+        .text(`${options.store.storeAddress} | Tel: ${options.store.storePhone}`, {
+          align: 'center',
+        });
+      doc.moveDown(0.35);
+      doc.fontSize(13).font('Helvetica-Bold').fillColor('#0f172a').text(options.title, {
+        align: 'center',
+      });
+
+      const metaParts = [
+        ...(options.subtitle ? [options.subtitle] : []),
+        `Generated: ${fmtDate(new Date())}`,
+      ];
+      doc.fontSize(8.5).font('Helvetica').fillColor('#475569').text(metaParts.join(' | '), {
+        align: 'center',
+      });
+      if (options.filterSummary) {
+        doc
+          .fontSize(8.5)
+          .font('Helvetica-Bold')
+          .fillColor('#0f172a')
+          .text(`Filters Applied: ${options.filterSummary}`, { align: 'center' });
+      }
+      doc.moveDown(0.75);
+
+      if (options.summaryRows.length > 0) {
+        doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('Summary');
+        doc.moveDown(0.2);
+        doc.fontSize(8.5).font('Helvetica').fillColor('#1e293b');
+        for (const s of options.summaryRows) {
+          doc.text(`${s.label}: ${s.value}`);
+        }
+        doc.moveDown(0.75);
+      }
+
+      if (options.columns.length === 0) return;
+
+      const totalWeight = options.columns.reduce((sum, c) => sum + (c.weight ?? 14), 0);
+      const colWidths = options.columns.map((c) => ((c.weight ?? 14) / totalWeight) * usableWidth);
+      const colStarts: number[] = [];
+      let cursorX = margin;
+      for (const w of colWidths) {
+        colStarts.push(cursorX);
+        cursorX += w;
+      }
+
+      const drawHeader = (startY: number) => {
+        doc.rect(margin, startY, usableWidth, 20).fill('#0f172a');
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(8);
+        options.columns.forEach((col, i) => {
+          doc.text(col.header, colStarts[i] + 3, startY + 6, {
+            width: Math.max(12, colWidths[i] - 6),
+            align: col.align ?? 'left',
+          });
+        });
+        return startY + 24;
+      };
+
+      let y = drawHeader(doc.y);
+
+      if (options.rows.length === 0) {
+        doc.fillColor('#64748b').font('Helvetica').fontSize(9).text('No records match the active filters.', margin, y + 6);
+        return;
+      }
+
+      doc.font('Helvetica').fontSize(8);
+      for (let rowIdx = 0; rowIdx < options.rows.length; rowIdx++) {
+        const row = options.rows[rowIdx];
+        let rowHeight = 14;
+        options.columns.forEach((_, i) => {
+          const text = row[i] ?? '';
+          const h = doc.heightOfString(text, { width: Math.max(12, colWidths[i] - 6) });
+          if (h + 4 > rowHeight) rowHeight = h + 4;
+        });
+
+        if (y + rowHeight > maxY) {
+          doc.addPage();
+          y = drawHeader(margin);
+          doc.font('Helvetica').fontSize(8);
+        }
+
+        if (rowIdx % 2 === 1) {
+          doc.rect(margin, y - 2, usableWidth, rowHeight).fill('#f8fafc');
+        }
+
+        doc.fillColor('#0f172a');
+        options.columns.forEach((col, i) => {
+          doc.text(row[i] ?? '', colStarts[i] + 3, y, {
+            width: Math.max(12, colWidths[i] - 6),
+            align: col.align ?? 'left',
+          });
+        });
+
+        y += rowHeight + 2;
+        doc.moveTo(margin, y - 1).lineTo(margin + usableWidth, y - 1).strokeColor('#e2e8f0').stroke();
+        y += 2;
+      }
+    },
+    { layout: isLandscape ? 'landscape' : 'portrait' }
+  );
 }
 
 export async function generateFinancialReportPdf(
