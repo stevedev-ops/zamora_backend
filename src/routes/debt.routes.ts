@@ -136,6 +136,12 @@ router.get(
         { header: 'Type', key: 'transactionType', width: 16 },
         { header: 'Dir', key: 'direction', width: 9 },
         { header: 'Description', key: 'description', width: 28 },
+        {
+          header: 'Note / Reason',
+          key: 'reason',
+          width: 24,
+          format: (r) => r.reason || r.sale?.notes || '',
+        },
         { header: `Amount (${cur})`, key: 'amount', width: 14, align: 'right', money: true },
         {
           header: `Balance (${cur})`,

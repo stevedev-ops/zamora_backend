@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { toNumber } from '../lib/money';
+import { resolveCalendarDayWindow } from '../lib/dateFilter';
 
 function startOfDay(d: Date): Date {
   const copy = new Date(d);
@@ -11,9 +12,17 @@ function startOfMonth(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
 }
 
-export async function getDashboardData(chartPeriod: 'daily' | 'weekly' | 'monthly' = 'daily') {
+export async function getDashboardData(
+  chartPeriod: 'daily' | 'weekly' | 'monthly' = 'daily',
+  options?: { date?: string; tzOffsetMinutes?: number }
+) {
   const now = new Date();
-  const todayStart = startOfDay(now);
+  const todayWindow = resolveCalendarDayWindow({
+    date: options?.date,
+    tzOffsetMinutes: options?.tzOffsetMinutes,
+  });
+  const todayStart = todayWindow.start;
+  const todayEnd = todayWindow.end;
   const monthStart = startOfMonth(now);
 
   const [
@@ -23,6 +32,7 @@ export async function getDashboardData(chartPeriod: 'daily' | 'weekly' | 'monthl
     purchasesTotalAgg,
     debtAgg,
     paymentsTodayAgg,
+    repaymentsTodayByMethod,
     paymentsMonthAgg,
     paymentsAllAgg,
     activeCustomersCount,
@@ -34,8 +44,15 @@ export async function getDashboardData(chartPeriod: 'daily' | 'weekly' | 'monthl
     recentDebtTransactions,
   ] = await Promise.all([
     prisma.sale.aggregate({
-      where: { status: 'COMPLETED', soldAt: { gte: todayStart } },
-      _sum: { totalAmount: true, grossProfit: true, amountPaid: true, outstandingAmount: true },
+      where: { status: 'COMPLETED', soldAt: { gte: todayStart, lte: todayEnd } },
+      _sum: {
+        totalAmount: true,
+        grossProfit: true,
+        amountPaid: true,
+        outstandingAmount: true,
+        cashAmount: true,
+        mpesaAmount: true,
+      },
       _count: { id: true },
     }),
     prisma.sale.aggregate({
@@ -54,7 +71,15 @@ export async function getDashboardData(chartPeriod: 'daily' | 'weekly' | 'monthl
       _sum: { currentBalance: true },
     }),
     prisma.payment.aggregate({
-      where: { paidAt: { gte: todayStart } },
+      where: { paidAt: { gte: todayStart, lte: todayEnd } },
+      _sum: { amount: true },
+    }),
+    prisma.payment.groupBy({
+      by: ['method'],
+      where: {
+        paymentType: 'DEBT_REPAYMENT',
+        paidAt: { gte: todayStart, lte: todayEnd },
+      },
       _sum: { amount: true },
     }),
     prisma.payment.aggregate({
@@ -128,10 +153,25 @@ export async function getDashboardData(chartPeriod: 'daily' | 'weekly' | 'monthl
 
   const chartData = await buildSalesProfitChartSeries(chartPeriod);
 
+  let debtRepaymentsCashToday = 0;
+  let debtRepaymentsMpesaToday = 0;
+  for (const row of repaymentsTodayByMethod) {
+    const amt = toNumber(row._sum.amount ?? 0);
+    if (row.method === 'CASH') debtRepaymentsCashToday += amt;
+    else if (row.method === 'MPESA') debtRepaymentsMpesaToday += amt;
+  }
+
   return {
     kpis: {
+      closingDateLabel: todayWindow.dateLabel,
       totalSalesToday: toNumber(salesTodayAgg._sum.totalAmount ?? 0),
       salesCountToday: salesTodayAgg._count.id,
+      cashSalesToday: toNumber(salesTodayAgg._sum.cashAmount ?? 0),
+      mpesaSalesToday: toNumber(salesTodayAgg._sum.mpesaAmount ?? 0),
+      debtSalesToday: toNumber(salesTodayAgg._sum.outstandingAmount ?? 0),
+      debtRepaymentsCashToday: Number(debtRepaymentsCashToday.toFixed(2)),
+      debtRepaymentsMpesaToday: Number(debtRepaymentsMpesaToday.toFixed(2)),
+      debtRepaymentsTotalToday: Number((debtRepaymentsCashToday + debtRepaymentsMpesaToday).toFixed(2)),
       totalSalesThisMonth: toNumber(salesMonthAgg._sum.totalAmount ?? 0),
       salesCountThisMonth: salesMonthAgg._count.id,
       totalPurchasesThisMonth: toNumber(purchasesMonthAgg._sum.totalCost ?? 0),

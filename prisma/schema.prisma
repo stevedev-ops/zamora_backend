@@ -725,6 +725,7 @@ model Setting {
   currency              String   @default("KSh")
   receiptFooter         String   @default("Thank you for shopping with us! Drink responsibly.") @map("receipt_footer")
   mpesaEnabled          Boolean  @default(true) @map("mpesa_enabled")
+  mpesaType             String   @default("PAYBILL") @map("mpesa_type")
   mpesaPaybillOrTill    String?  @map("mpesa_paybill_or_till")
   mpesaAccountReference String?  @map("mpesa_account_reference")
   smsEnabled            Boolean  @default(true) @map("sms_enabled")

@@ -1,6 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { toDecimal, toNumber } from '../lib/money';
 import { recordAuditLog } from '../lib/audit';
+import { MpesaPaymentOptionType, normalizeMpesaType } from '../lib/mpesaDisplay';
 
 export async function getStoreSettings() {
   let settings = await prisma.setting.findUnique({ where: { key: 'default' } });
@@ -11,6 +12,7 @@ export async function getStoreSettings() {
   }
   return {
     ...settings,
+    mpesaType: normalizeMpesaType(settings),
     defaultCreditLimit: toNumber(settings.defaultCreditLimit),
   };
 }
@@ -24,6 +26,7 @@ export async function updateStoreSettings(
     currency?: string;
     receiptFooter?: string;
     mpesaEnabled?: boolean;
+    mpesaType?: MpesaPaymentOptionType;
     mpesaPaybillOrTill?: string | null;
     mpesaAccountReference?: string | null;
     smsEnabled?: boolean;
@@ -48,6 +51,7 @@ export async function updateStoreSettings(
         ...(input.currency !== undefined ? { currency: input.currency.trim() } : {}),
         ...(input.receiptFooter !== undefined ? { receiptFooter: input.receiptFooter.trim() } : {}),
         ...(input.mpesaEnabled !== undefined ? { mpesaEnabled: input.mpesaEnabled } : {}),
+        ...(input.mpesaType !== undefined ? { mpesaType: input.mpesaType } : {}),
         ...(input.mpesaPaybillOrTill !== undefined
           ? { mpesaPaybillOrTill: input.mpesaPaybillOrTill?.trim() || null }
           : {}),
@@ -84,6 +88,7 @@ export async function updateStoreSettings(
 
   return {
     ...updated,
+    mpesaType: normalizeMpesaType(updated),
     defaultCreditLimit: toNumber(updated.defaultCreditLimit),
   };
 }

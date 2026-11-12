@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { MoneyInput, toNumber } from '../lib/money';
+import { formatMpesaPaymentSummary } from '../lib/mpesaDisplay';
 
 function buildPdfBuffer(
   render: (doc: PDFKit.PDFDocument) => void,
@@ -45,15 +46,13 @@ export interface StoreHeaderInfo {
   currency: string;
   receiptFooter: string;
   mpesaEnabled?: boolean;
+  mpesaType?: string | null;
   mpesaPaybillOrTill?: string | null;
   mpesaAccountReference?: string | null;
 }
 
 function formatMpesaPayInfo(store: StoreHeaderInfo): string | null {
-  if (!store.mpesaEnabled || !store.mpesaPaybillOrTill) return null;
-  const label = store.mpesaAccountReference ? 'M-Pesa Paybill' : 'M-Pesa Till No.';
-  const acct = store.mpesaAccountReference ? ` | Account: ${store.mpesaAccountReference}` : '';
-  return `${label}: ${store.mpesaPaybillOrTill}${acct}`;
+  return formatMpesaPaymentSummary(store);
 }
 
 export async function generateSaleReceiptPdf(

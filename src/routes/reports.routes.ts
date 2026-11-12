@@ -5,10 +5,145 @@ import * as reportService from '../services/report.service';
 import { getStoreSettings } from '../services/settings.service';
 import { generateFinancialReportPdf } from '../integrations/pdf';
 import { generateExcelWorkbook } from '../integrations/excel';
-import { sendTableExport } from '../integrations/export';
+import { sendTableExport, parseExportFormat, exportFmtMoney, exportFmtDateTime } from '../integrations/export';
 
 const router = Router();
 router.use(requireOwner);
+
+router.get(
+  '/closing',
+  asyncHandler(async (req, res) => {
+    const rawOffset = req.query.tzOffsetMinutes as string | undefined;
+    const tzOffsetMinutes =
+      rawOffset !== undefined && !Number.isNaN(Number(rawOffset))
+        ? Number(rawOffset)
+        : undefined;
+    const summary = await reportService.getDailyClosingSummary({
+      date: req.query.date as string | undefined,
+      tzOffsetMinutes,
+    });
+    res.json(summary);
+  })
+);
+
+router.get(
+  '/closing/export/:format',
+  asyncHandler(async (req, res) => {
+    const format = parseExportFormat(req.params.format as string);
+    const rawOffset = req.query.tzOffsetMinutes as string | undefined;
+    const tzOffsetMinutes =
+      rawOffset !== undefined && !Number.isNaN(Number(rawOffset))
+        ? Number(rawOffset)
+        : undefined;
+
+    const [closing, settings] = await Promise.all([
+      reportService.getDailyClosingSummary({
+        date: req.query.date as string | undefined,
+        tzOffsetMinutes,
+      }),
+      getStoreSettings(),
+    ]);
+
+    const cur = settings.currency || 'KSh';
+
+    await sendTableExport(res, {
+      format,
+      filenameBase: `zamora-closing-summary-${closing.date}`,
+      title: `Daily Closing Summary (${closing.date})`,
+      subtitle: `${closing.salesCount} sale(s) · ${closing.itemsSold} bottle(s) sold`,
+      filterSummary: `Date: ${closing.date}`,
+      summaryRows: [
+        { label: 'Total Sold Today', value: exportFmtMoney(cur, closing.totalSold) },
+        { label: 'Cash Sales', value: exportFmtMoney(cur, closing.breakdown.cash.amount) },
+        { label: 'M-Pesa Sales', value: exportFmtMoney(cur, closing.breakdown.mpesa.amount) },
+        { label: 'Debt Sales (Credit)', value: exportFmtMoney(cur, closing.breakdown.debt.amount) },
+        {
+          label: 'Debt Repayments (Cash / M-Pesa)',
+          value: `${exportFmtMoney(cur, closing.repayments.cash)} / ${exportFmtMoney(cur, closing.repayments.mpesa)}`,
+        },
+        {
+          label: 'Total Cash Collected (incl. Repayments)',
+          value: exportFmtMoney(cur, closing.reconciliation.totalCashCollected),
+        },
+        {
+          label: 'Total M-Pesa Collected (incl. Repayments)',
+          value: exportFmtMoney(cur, closing.reconciliation.totalMpesaCollected),
+        },
+        {
+          label: 'Expenses Today (Cash / M-Pesa)',
+          value: `${exportFmtMoney(cur, closing.expenses.cash)} / ${exportFmtMoney(cur, closing.expenses.mpesa)}`,
+        },
+        { label: 'Net Cash in Drawer', value: exportFmtMoney(cur, closing.reconciliation.netCashInDrawer) },
+        { label: 'Gross Profit', value: exportFmtMoney(cur, closing.grossProfit) },
+      ],
+      columns: [
+        { header: 'Receipt #', key: 'receiptNumber', width: 14 },
+        {
+          header: 'Time',
+          key: 'soldAt',
+          width: 17,
+          format: (r) => exportFmtDateTime(r.soldAt),
+        },
+        { header: 'Customer', key: 'customerName', width: 20 },
+        { header: 'Method', key: 'paymentMethod', width: 10 },
+        { header: 'Items', key: 'itemsSummary', width: 28 },
+        { header: `Total (${cur})`, key: 'totalAmount', width: 13, align: 'right', money: true },
+        { header: `Cash (${cur})`, key: 'cashAmount', width: 13, align: 'right', money: true },
+        { header: `M-Pesa (${cur})`, key: 'mpesaAmount', width: 13, align: 'right', money: true },
+        { header: `Debt (${cur})`, key: 'outstandingAmount', width: 13, align: 'right', money: true },
+        { header: 'Note', key: 'notes', width: 22, format: (r) => r.notes || '' },
+      ],
+      rows: closing.sales,
+      extraExcelSheets: [
+        {
+          name: 'Closing Summary',
+          columns: [
+            { header: 'Metric', key: 'metric', width: 34 },
+            { header: `Amount (${cur})`, key: 'amount', width: 18 },
+            { header: 'Count', key: 'count', width: 12 },
+          ],
+          rows: [
+            { metric: 'Total Sold Today', amount: closing.totalSold, count: closing.salesCount },
+            { metric: 'Cash Sales', amount: closing.breakdown.cash.amount, count: closing.breakdown.cash.count },
+            { metric: 'M-Pesa Sales', amount: closing.breakdown.mpesa.amount, count: closing.breakdown.mpesa.count },
+            { metric: 'Debt Sales (Credit)', amount: closing.breakdown.debt.amount, count: closing.breakdown.debt.count },
+            { metric: 'Debt Repayments - Cash', amount: closing.repayments.cash, count: '' },
+            { metric: 'Debt Repayments - M-Pesa', amount: closing.repayments.mpesa, count: '' },
+            { metric: 'Total Cash Collected', amount: closing.reconciliation.totalCashCollected, count: '' },
+            { metric: 'Total M-Pesa Collected', amount: closing.reconciliation.totalMpesaCollected, count: '' },
+            { metric: 'Expenses - Cash', amount: closing.expenses.cash, count: '' },
+            { metric: 'Expenses - M-Pesa', amount: closing.expenses.mpesa, count: '' },
+            { metric: 'Net Cash in Drawer', amount: closing.reconciliation.netCashInDrawer, count: '' },
+            { metric: 'Net M-Pesa Balance', amount: closing.reconciliation.netMpesaBalance, count: '' },
+            { metric: 'Gross Profit', amount: closing.grossProfit, count: '' },
+          ],
+        },
+        ...(closing.repayments.rows.length > 0
+          ? [
+              {
+                name: 'Debt Repayments',
+                columns: [
+                  { header: 'Ref #', key: 'referenceNumber', width: 15 },
+                  { header: 'Customer', key: 'customerName', width: 22 },
+                  { header: 'Method', key: 'method', width: 12 },
+                  { header: 'M-Pesa Ref', key: 'mpesaReference', width: 16 },
+                  { header: `Amount (${cur})`, key: 'amount', width: 15 },
+                ],
+                rows: closing.repayments.rows.map((p) => ({
+                  referenceNumber: p.referenceNumber,
+                  customerName: p.customerName,
+                  method: p.method,
+                  mpesaReference: p.mpesaReference || '',
+                  amount: p.amount,
+                })),
+              },
+            ]
+          : []),
+      ],
+      store: settings,
+    });
+  })
+);
 
 router.get(
   '/',

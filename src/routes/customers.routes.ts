@@ -159,6 +159,18 @@ router.patch(
   })
 );
 
+router.delete(
+  '/:id',
+  asyncHandler(async (req, res) => {
+    const result = await customerService.deleteCustomer(
+      req.params.id as string,
+      req.owner!.id,
+      req.ip
+    );
+    res.json(result);
+  })
+);
+
 router.post(
   '/:id/credit-limit',
   validateBody(creditLimitSchema),
@@ -271,6 +283,12 @@ router.get(
         { header: 'Type', key: 'transactionType', width: 18 },
         { header: 'Direction', key: 'direction', width: 10 },
         { header: 'Description', key: 'description', width: 32 },
+        {
+          header: 'Note / Reason',
+          key: 'reason',
+          width: 24,
+          format: (r) => r.reason || r.sale?.notes || '',
+        },
         { header: `Amount (${cur})`, key: 'amount', width: 15, align: 'right', money: true },
         { header: `Balance (${cur})`, key: 'runningBalance', width: 15, align: 'right', money: true },
       ],

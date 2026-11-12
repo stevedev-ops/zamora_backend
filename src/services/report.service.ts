@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
-import { calculateMarginPercent, toNumber } from '../lib/money';
+import { calculateMarginPercent, MoneyInput, toNumber } from '../lib/money';
+import { resolveCalendarDayWindow } from '../lib/dateFilter';
 
 export type DatePreset =
   | 'today'
@@ -423,6 +424,265 @@ export async function getFinancialAnalyticsReport(params: {
       payee: e.payee,
       expenseDate: e.expenseDate,
     })),
+  };
+}
+
+export interface DailyClosingSaleInput {
+  id: string;
+  receiptNumber: string;
+  paymentMethod: string;
+  totalAmount: MoneyInput;
+  cashAmount: MoneyInput;
+  mpesaAmount: MoneyInput;
+  amountPaid: MoneyInput;
+  outstandingAmount: MoneyInput;
+  grossProfit: MoneyInput;
+  discountAmount: MoneyInput;
+  mpesaReference?: string | null;
+  notes?: string | null;
+  soldAt: Date;
+  customer?: { id: string; fullName: string; accountNumber: string } | null;
+  items: Array<{ quantity: number; productName: string; bottleSize: string }>;
+}
+
+export interface DailyClosingPaymentInput {
+  id: string;
+  referenceNumber: string;
+  paymentType: string;
+  method: string;
+  mpesaReference?: string | null;
+  amount: MoneyInput;
+  paidAt: Date;
+  customer?: { id: string; fullName: string; accountNumber: string } | null;
+}
+
+export interface DailyClosingExpenseInput {
+  id: string;
+  referenceNumber: string;
+  category: string;
+  title: string;
+  amount: MoneyInput;
+  paymentMethod: string;
+  payee?: string | null;
+  expenseDate: Date;
+}
+
+const round2 = (n: number): number => Number(n.toFixed(2));
+
+/**
+ * Computes end-of-day closing totals split across Cash, M-Pesa, and Debt
+ * (splitting SPLIT sales accurately into their Cash, M-Pesa, and Debt components).
+ */
+export function summarizeDailyClosing(
+  sales: DailyClosingSaleInput[],
+  payments: DailyClosingPaymentInput[],
+  expenses: DailyClosingExpenseInput[]
+) {
+  let totalSold = 0;
+  let totalGrossProfit = 0;
+  let totalDiscounts = 0;
+  let itemsSold = 0;
+
+  let cashSalesAmount = 0;
+  let cashSalesCount = 0;
+  let cashPureCount = 0;
+
+  let mpesaSalesAmount = 0;
+  let mpesaSalesCount = 0;
+  let mpesaPureCount = 0;
+
+  let debtSalesAmount = 0;
+  let debtSalesCount = 0;
+  let debtPureCount = 0;
+  let splitSalesCount = 0;
+
+  for (const s of sales) {
+    const total = toNumber(s.totalAmount);
+    const cash = toNumber(s.cashAmount);
+    const mpesa = toNumber(s.mpesaAmount);
+    const debt = toNumber(s.outstandingAmount);
+    const profit = toNumber(s.grossProfit);
+    const discount = toNumber(s.discountAmount);
+
+    totalSold += total;
+    totalGrossProfit += profit;
+    totalDiscounts += discount;
+    itemsSold += s.items.reduce((sum, item) => sum + item.quantity, 0);
+
+    if (cash > 0) cashSalesCount += 1;
+    if (mpesa > 0) mpesaSalesCount += 1;
+    if (debt > 0) debtSalesCount += 1;
+
+    if (s.paymentMethod === 'CASH') cashPureCount += 1;
+    else if (s.paymentMethod === 'MPESA') mpesaPureCount += 1;
+    else if (s.paymentMethod === 'CREDIT') debtPureCount += 1;
+    else if (s.paymentMethod === 'SPLIT') splitSalesCount += 1;
+
+    cashSalesAmount += cash;
+    mpesaSalesAmount += mpesa;
+    debtSalesAmount += debt;
+  }
+
+  let debtRepaymentsCash = 0;
+  let debtRepaymentsMpesa = 0;
+  let debtRepaymentsCount = 0;
+  const repayments: Array<{
+    id: string;
+    referenceNumber: string;
+    customerName: string;
+    accountNumber: string | null;
+    method: string;
+    mpesaReference: string | null;
+    amount: number;
+    paidAt: Date;
+  }> = [];
+
+  for (const p of payments) {
+    if (p.paymentType !== 'DEBT_REPAYMENT') continue;
+    const amt = toNumber(p.amount);
+    debtRepaymentsCount += 1;
+    if (p.method === 'CASH') debtRepaymentsCash += amt;
+    else if (p.method === 'MPESA') debtRepaymentsMpesa += amt;
+
+    repayments.push({
+      id: p.id,
+      referenceNumber: p.referenceNumber,
+      customerName: p.customer?.fullName ?? 'Walk-in Customer',
+      accountNumber: p.customer?.accountNumber ?? null,
+      method: p.method,
+      mpesaReference: p.mpesaReference ?? null,
+      amount: round2(amt),
+      paidAt: p.paidAt,
+    });
+  }
+
+  let expensesCash = 0;
+  let expensesMpesa = 0;
+  for (const e of expenses) {
+    const amt = toNumber(e.amount);
+    if (e.paymentMethod === 'MPESA') expensesMpesa += amt;
+    else expensesCash += amt;
+  }
+
+  const totalCashCollected = cashSalesAmount + debtRepaymentsCash;
+  const totalMpesaCollected = mpesaSalesAmount + debtRepaymentsMpesa;
+  const expensesTotal = expensesCash + expensesMpesa;
+
+  return {
+    totalSold: round2(totalSold),
+    salesCount: sales.length,
+    itemsSold,
+    grossProfit: round2(totalGrossProfit),
+    discountsGiven: round2(totalDiscounts),
+    splitSalesCount,
+    breakdown: {
+      cash: {
+        amount: round2(cashSalesAmount),
+        count: cashSalesCount,
+        pureCount: cashPureCount,
+      },
+      mpesa: {
+        amount: round2(mpesaSalesAmount),
+        count: mpesaSalesCount,
+        pureCount: mpesaPureCount,
+      },
+      debt: {
+        amount: round2(debtSalesAmount),
+        count: debtSalesCount,
+        pureCount: debtPureCount,
+      },
+    },
+    repayments: {
+      total: round2(debtRepaymentsCash + debtRepaymentsMpesa),
+      cash: round2(debtRepaymentsCash),
+      mpesa: round2(debtRepaymentsMpesa),
+      count: debtRepaymentsCount,
+      rows: repayments,
+    },
+    expenses: {
+      total: round2(expensesTotal),
+      cash: round2(expensesCash),
+      mpesa: round2(expensesMpesa),
+      count: expenses.length,
+      rows: expenses.map((e) => ({
+        id: e.id,
+        referenceNumber: e.referenceNumber,
+        category: e.category,
+        title: e.title,
+        amount: round2(toNumber(e.amount)),
+        paymentMethod: e.paymentMethod,
+        payee: e.payee ?? null,
+        expenseDate: e.expenseDate,
+      })),
+    },
+    reconciliation: {
+      totalCashCollected: round2(totalCashCollected),
+      totalMpesaCollected: round2(totalMpesaCollected),
+      totalMoneyIn: round2(totalCashCollected + totalMpesaCollected),
+      netCashInDrawer: round2(totalCashCollected - expensesCash),
+      netMpesaBalance: round2(totalMpesaCollected - expensesMpesa),
+    },
+    sales: sales.map((s) => ({
+      id: s.id,
+      receiptNumber: s.receiptNumber,
+      customerName: s.customer?.fullName ?? 'Walk-in Customer',
+      accountNumber: s.customer?.accountNumber ?? null,
+      paymentMethod: s.paymentMethod,
+      totalAmount: round2(toNumber(s.totalAmount)),
+      cashAmount: round2(toNumber(s.cashAmount)),
+      mpesaAmount: round2(toNumber(s.mpesaAmount)),
+      amountPaid: round2(toNumber(s.amountPaid)),
+      outstandingAmount: round2(toNumber(s.outstandingAmount)),
+      grossProfit: round2(toNumber(s.grossProfit)),
+      mpesaReference: s.mpesaReference ?? null,
+      notes: s.notes ?? null,
+      itemCount: s.items.reduce((sum, item) => sum + item.quantity, 0),
+      itemsSummary: s.items.map((i) => `${i.productName} (${i.bottleSize}) x${i.quantity}`).join(', '),
+      soldAt: s.soldAt,
+    })),
+  };
+}
+
+export async function getDailyClosingSummary(params?: {
+  date?: string;
+  tzOffsetMinutes?: number;
+}) {
+  const window = resolveCalendarDayWindow(params);
+
+  const [sales, payments, expenses] = await Promise.all([
+    prisma.sale.findMany({
+      where: {
+        status: 'COMPLETED',
+        soldAt: { gte: window.start, lte: window.end },
+      },
+      include: {
+        customer: { select: { id: true, fullName: true, accountNumber: true } },
+        items: { select: { quantity: true, productName: true, bottleSize: true } },
+      },
+      orderBy: { soldAt: 'desc' },
+    }),
+    prisma.payment.findMany({
+      where: {
+        paidAt: { gte: window.start, lte: window.end },
+      },
+      include: {
+        customer: { select: { id: true, fullName: true, accountNumber: true } },
+      },
+      orderBy: { paidAt: 'desc' },
+    }),
+    prisma.expense.findMany({
+      where: {
+        expenseDate: { gte: window.start, lte: window.end },
+      },
+      orderBy: { expenseDate: 'desc' },
+    }),
+  ]);
+
+  return {
+    date: window.dateLabel,
+    periodStart: window.start,
+    periodEnd: window.end,
+    ...summarizeDailyClosing(sales, payments, expenses),
   };
 }
 

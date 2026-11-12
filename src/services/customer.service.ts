@@ -7,6 +7,8 @@ import { generateSecureToken } from '../lib/crypto';
 import { ConflictError, NotFoundError, ValidationError } from '../lib/errors';
 import { recordAuditLog } from '../lib/audit';
 import { env } from '../config/env';
+import { formatMpesaPaymentSummary } from '../lib/mpesaDisplay';
+import { lockCustomerAccountTx } from './debt.service';
 import {
   buildWhatsAppShareUrl,
   dispatchNotification,
@@ -135,11 +137,18 @@ export async function getCustomerProfile(id: string) {
 
   if (!customer) throw new NotFoundError('Customer not found');
 
-  const portalUrl = await ensureActiveCustomerPortalLink(customer.id);
+  const [portalUrl, settings] = await Promise.all([
+    ensureActiveCustomerPortalLink(customer.id),
+    prisma.setting.findUnique({ where: { key: 'default' } }),
+  ]);
   const currentDebt = toNumber(customer.account?.currentBalance ?? 0);
-  const shareMessage = `Hello ${customer.fullName}, your Zamora Liquor Store account (${customer.accountNumber}) current balance is KSh ${currentDebt.toFixed(
-    2
-  )}. View your itemized statement securely here: ${portalUrl}`;
+  const currency = settings?.currency || 'KSh';
+  const mpesaInfo = settings ? formatMpesaPaymentSummary(settings, customer.accountNumber) : null;
+  const shareMessage = `Hello ${customer.fullName}, your ${
+    settings?.storeName || 'Zamora Liquor Store'
+  } account (${customer.accountNumber}) current balance is ${currency} ${currentDebt.toFixed(2)}.${
+    mpesaInfo ? ` Pay via ${mpesaInfo}.` : ''
+  } View your itemized statement securely here: ${portalUrl}`;
 
   return {
     id: customer.id,
@@ -343,6 +352,94 @@ export async function updateCustomer(
   });
 }
 
+export async function deleteCustomer(
+  id: string,
+  userId: string,
+  ipAddress?: string
+) {
+  return prisma.$transaction(async (tx) => {
+    const existing = await tx.customer.findUnique({
+      where: { id },
+      include: { account: true },
+    });
+    if (!existing) throw new NotFoundError('Customer not found');
+
+    let currentBalance = toDecimal(existing.account?.currentBalance ?? 0);
+    if (existing.account) {
+      const locked = await lockCustomerAccountTx(tx, id);
+      currentBalance = toDecimal(locked.current_balance);
+    }
+
+    if (currentBalance.gt(0)) {
+      throw new ValidationError(
+        `Cannot delete ${existing.fullName} because they have an outstanding debt of KSh ${currentBalance.toFixed(
+          2
+        )}. Clear or settle their debt first.`
+      );
+    }
+    if (!currentBalance.isZero()) {
+      throw new ValidationError(
+        `Cannot delete ${existing.fullName} while account balance is non-zero (KSh ${currentBalance.toFixed(2)}).`
+      );
+    }
+
+    const pendingTransfers = await tx.debtTransfer.count({
+      where: { fromCustomerId: id, status: 'PENDING_ACCEPTANCE' },
+    });
+    if (pendingTransfers > 0) {
+      throw new ValidationError(
+        `Cannot delete ${existing.fullName} while they have a pending outgoing debt transfer.`
+      );
+    }
+
+    await tx.clarificationRequest.deleteMany({ where: { customerId: id } });
+    await tx.debtTransaction.updateMany({
+      where: { customerId: id, reversedTransactionId: { not: null } },
+      data: { reversedTransactionId: null },
+    });
+    await tx.debtTransaction.updateMany({
+      where: {
+        reversedTransactionId: { not: null },
+        reversedTransaction: { customerId: id },
+      },
+      data: { reversedTransactionId: null },
+    });
+    await tx.debtTransaction.deleteMany({ where: { customerId: id } });
+    await tx.debtTransfer.deleteMany({
+      where: { OR: [{ fromCustomerId: id }, { toCustomerId: id }] },
+    });
+
+    await tx.sale.updateMany({ where: { customerId: id }, data: { customerId: null } });
+    await tx.payment.updateMany({ where: { customerId: id }, data: { customerId: null } });
+    await tx.notification.updateMany({ where: { customerId: id }, data: { customerId: null } });
+    await tx.mpesaTransaction.updateMany({ where: { customerId: id }, data: { customerId: null } });
+
+    await tx.customer.delete({ where: { id } });
+
+    await recordAuditLog(tx, {
+      actorType: 'OWNER',
+      actorId: userId,
+      userId,
+      action: 'CUSTOMER_DELETED',
+      entityType: 'Customer',
+      entityId: id,
+      metadata: {
+        accountNumber: existing.accountNumber,
+        fullName: existing.fullName,
+        phone: existing.phone,
+      },
+      ipAddress,
+    });
+
+    return {
+      deleted: true,
+      id,
+      fullName: existing.fullName,
+      accountNumber: existing.accountNumber,
+    };
+  });
+}
+
 export async function updateCustomerCreditLimit(
   customerId: string,
   limitAmount: number,
@@ -461,7 +558,10 @@ export async function shareCustomerPortalLink(
   const currency = settings?.currency || 'KSh';
   const balance = toNumber(customer.account?.currentBalance ?? 0).toFixed(2);
 
-  const message = `${storeName}: Hello ${customer.fullName} (${customer.accountNumber}), your current debt balance is ${currency} ${balance}. View your itemized statement and receipts here: ${portalUrl}`;
+  const mpesaInfo = settings ? formatMpesaPaymentSummary(settings, customer.accountNumber) : null;
+  const message = `${storeName}: Hello ${customer.fullName} (${customer.accountNumber}), your current debt balance is ${currency} ${balance}.${
+    mpesaInfo ? ` Pay via ${mpesaInfo}.` : ''
+  } View your itemized statement and receipts here: ${portalUrl}`;
 
   const notification = await dispatchNotification({
     customerId: customer.id,

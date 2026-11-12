@@ -33,6 +33,7 @@ export async function ensureInitialStoreBootstrap(): Promise<void> {
       currency: 'KSh',
       receiptFooter: 'Thank you for shopping at Zamora Liquor Store! Drink responsibly.',
       mpesaEnabled: true,
+      mpesaType: 'PAYBILL',
       mpesaPaybillOrTill: '522533',
       mpesaAccountReference: 'ZAMORA',
       smsEnabled: true,

@@ -143,6 +143,7 @@ router.get(
           money: true,
         },
         { header: 'Status', key: 'status', width: 10 },
+        { header: 'Note', key: 'notes', width: 22, format: (r) => r.notes || '' },
       ],
       rows: sales,
       store: settings,

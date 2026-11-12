@@ -21,6 +21,7 @@ const settingsUpdateSchema = z.object({
   currency: z.string().min(1).max(10).optional(),
   receiptFooter: z.string().max(300).optional(),
   mpesaEnabled: z.boolean().optional(),
+  mpesaType: z.enum(['POCHI_LA_BIASHARA', 'PAYBILL', 'TILL']).optional(),
   mpesaPaybillOrTill: z.string().max(40).nullable().optional(),
   mpesaAccountReference: z.string().max(40).nullable().optional(),
   smsEnabled: z.boolean().optional(),

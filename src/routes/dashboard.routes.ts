@@ -12,7 +12,15 @@ router.get(
     const periodParam = req.query.period as string | undefined;
     const period =
       periodParam === 'weekly' || periodParam === 'monthly' ? periodParam : 'daily';
-    const data = await getDashboardData(period);
+    const rawOffset = req.query.tzOffsetMinutes as string | undefined;
+    const tzOffsetMinutes =
+      rawOffset !== undefined && !Number.isNaN(Number(rawOffset))
+        ? Number(rawOffset)
+        : undefined;
+    const data = await getDashboardData(period, {
+      date: req.query.date as string | undefined,
+      tzOffsetMinutes,
+    });
     res.json(data);
   })
 );

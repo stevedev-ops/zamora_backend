@@ -363,6 +363,9 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
   });
 
   if (created.newCustomerBalance !== null && created.customerRecord) {
+    const noteSuffix = created.fullSale.notes?.trim()
+      ? ` Note: ${created.fullSale.notes.trim()}.`
+      : '';
     await notifyCustomerDebtEvent({
       customerId: created.customerRecord.id,
       customerName: created.customerRecord.fullName,
@@ -373,7 +376,7 @@ export async function createSale(input: CreateSaleInput, userId: string, ipAddre
         created.fullSale.totalAmount
       )} was recorded (Paid: KSh ${toFixed2(created.fullSale.amountPaid)}, Added to debt: KSh ${toFixed2(
         created.fullSale.outstandingAmount
-      )}).`,
+      )}).${noteSuffix}`,
       newBalance: created.newCustomerBalance.toFixed(2),
     });
   }

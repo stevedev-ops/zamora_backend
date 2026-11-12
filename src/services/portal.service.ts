@@ -4,6 +4,7 @@ import { generateNumericOtp, hashToken } from '../lib/crypto';
 import { signPortalJwt } from '../lib/jwt';
 import { maskPhone } from '../lib/phone';
 import { toNumber } from '../lib/money';
+import { normalizeMpesaType } from '../lib/mpesaDisplay';
 import { ForbiddenError, NotFoundError, UnauthorizedError, ValidationError } from '../lib/errors';
 import { dispatchNotification } from '../integrations/notifications';
 import {
@@ -208,6 +209,7 @@ export async function getCustomerPortalDashboard(
       currency: true,
       receiptFooter: true,
       mpesaEnabled: true,
+      mpesaType: true,
       mpesaPaybillOrTill: true,
       mpesaAccountReference: true,
     },
@@ -329,6 +331,7 @@ export async function getCustomerPortalDashboard(
       currency: settings?.currency || 'KSh',
       receiptFooter: settings?.receiptFooter || '',
       mpesaEnabled: settings?.mpesaEnabled ?? true,
+      mpesaType: normalizeMpesaType(settings || {}),
       mpesaPaybillOrTill: settings?.mpesaPaybillOrTill || null,
       mpesaAccountReference: settings?.mpesaAccountReference || null,
     },
