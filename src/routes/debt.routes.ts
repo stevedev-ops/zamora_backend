@@ -36,7 +36,7 @@ const transferSchema = z.object({
 });
 
 const acceptTransferSchema = z.object({
-  otp: z.string().min(4).max(10),
+  otp: z.string().max(10).optional(),
 });
 
 const adjustmentSchema = z.object({

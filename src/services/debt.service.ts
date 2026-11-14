@@ -275,6 +275,7 @@ export async function initiateDebtTransfer(
     throw new ValidationError('A reason for the debt transfer is required');
   }
 
+  // Idempotency: ensure transfer only goes ONCE
   if (input.idempotencyKey) {
     const existing = await prisma.debtTransfer.findUnique({
       where: { idempotencyKey: input.idempotencyKey },
@@ -284,15 +285,16 @@ export async function initiateDebtTransfer(
       },
     });
     if (existing) {
-      return { transfer: { ...existing, amount: toNumber(existing.amount) }, deduplicated: true };
+      return {
+        transfer: { ...existing, amount: toNumber(existing.amount) },
+        completed: existing.status === 'COMPLETED',
+        deduplicated: true,
+      };
     }
   }
 
   const rawToken = generateSecureToken(24);
-  const rawOtp = generateNumericOtp(6);
   const confirmationTokenHash = hashToken(rawToken);
-  const otpHash = hashToken(rawOtp);
-  const otpExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
   const created = await prisma.$transaction(async (tx) => {
     const fromCustomer = await tx.customer.findUnique({ where: { id: input.fromCustomerId } });
@@ -301,25 +303,32 @@ export async function initiateDebtTransfer(
       throw new NotFoundError('Both original and receiving customers must exist');
     }
 
-    const fromAccount = await lockCustomerAccountTx(tx, input.fromCustomerId);
-    const currentDebt = toDecimal(fromAccount.current_balance);
+    // Lock both customer accounts in deterministic UUID order to prevent deadlocks
+    const [firstId, secondId] =
+      input.fromCustomerId < input.toCustomerId
+        ? [input.fromCustomerId, input.toCustomerId]
+        : [input.toCustomerId, input.fromCustomerId];
 
-    // Ensure pending transfers + this transfer do not exceed current debt
-    const pendingAgg = await tx.debtTransfer.aggregate({
-      where: { fromCustomerId: input.fromCustomerId, status: 'PENDING_ACCEPTANCE' },
-      _sum: { amount: true },
+    await lockCustomerAccountTx(tx, firstId);
+    await lockCustomerAccountTx(tx, secondId);
+
+    const fromAccount = await tx.customerAccount.findUniqueOrThrow({
+      where: { customerId: input.fromCustomerId },
     });
-    const pendingTotal = toDecimal(pendingAgg._sum.amount ?? 0);
-    const availableToTransfer = subMoney(currentDebt, pendingTotal);
+    const toAccount = await tx.customerAccount.findUniqueOrThrow({
+      where: { customerId: input.toCustomerId },
+    });
 
-    if (amountDec.gt(currentDebt) || amountDec.gt(availableToTransfer)) {
+    const currentDebt = toDecimal(fromAccount.currentBalance);
+    if (amountDec.gt(currentDebt)) {
       throw new ValidationError(
-        `Transfer amount (${amountDec.toFixed(2)}) exceeds ${fromCustomer.fullName}'s available transferable debt (${availableToTransfer.toFixed(2)})`
+        `Transfer amount (${amountDec.toFixed(2)}) exceeds ${fromCustomer.fullName}'s current debt (${currentDebt.toFixed(2)})`
       );
     }
 
     const referenceNumber = await nextSequenceNumber(tx, 'debt_transfer', 'TRF', 5);
 
+    // Direct completion without OTP: transfer immediately posted to ledger
     const transfer = await tx.debtTransfer.create({
       data: {
         referenceNumber,
@@ -327,10 +336,12 @@ export async function initiateDebtTransfer(
         toCustomerId: input.toCustomerId,
         amount: amountDec.toFixed(2),
         reason: input.reason.trim(),
-        status: 'PENDING_ACCEPTANCE',
+        status: 'COMPLETED',
+        acceptedAt: new Date(),
+        acceptedMethod: 'DIRECT_OWNER',
         confirmationTokenHash,
-        otpHash,
-        otpExpiresAt,
+        otpHash: 'NONE',
+        otpExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         idempotencyKey: input.idempotencyKey || null,
         initiatedByUserId: userId,
       },
@@ -340,11 +351,37 @@ export async function initiateDebtTransfer(
       },
     });
 
+    // Reduce original customer's debt
+    const outLedger = await appendLedgerEntryTx(tx, {
+      customerId: input.fromCustomerId,
+      transactionType: 'TRANSFER_OUT',
+      direction: 'CREDIT',
+      amount: amountDec,
+      description: `Debt transferred to ${toCustomer.fullName} (${toCustomer.accountNumber}) [${referenceNumber}]`,
+      reason: input.reason.trim(),
+      debtTransferId: transfer.id,
+      userId,
+      accountStatsIncrement: { totalTransferredOut: amountDec },
+    });
+
+    // Increase receiving customer's debt
+    const inLedger = await appendLedgerEntryTx(tx, {
+      customerId: input.toCustomerId,
+      transactionType: 'TRANSFER_IN',
+      direction: 'DEBIT',
+      amount: amountDec,
+      description: `Debt transferred from ${fromCustomer.fullName} (${fromCustomer.accountNumber}) [${referenceNumber}]`,
+      reason: input.reason.trim(),
+      debtTransferId: transfer.id,
+      userId,
+      accountStatsIncrement: { totalTransferredIn: amountDec },
+    });
+
     await recordAuditLog(tx, {
       actorType: 'OWNER',
       actorId: userId,
       userId,
-      action: 'DEBT_TRANSFER_INITIATED',
+      action: 'DEBT_TRANSFER_COMPLETED',
       entityType: 'DebtTransfer',
       entityId: transfer.id,
       metadata: {
@@ -353,36 +390,43 @@ export async function initiateDebtTransfer(
         toCustomerId: input.toCustomerId,
         amount: amountDec.toNumber(),
         reason: input.reason.trim(),
+        fromNewBalance: outLedger.newBalance.toNumber(),
+        toNewBalance: inLedger.newBalance.toNumber(),
       },
       ipAddress,
     });
 
-    return transfer;
+    return {
+      transfer,
+      fromNewBalance: outLedger.newBalance,
+      toNewBalance: inLedger.newBalance,
+    };
   });
 
-  const confirmationUrl = `${env.frontendUrl}/transfer-confirm/${rawToken}`;
   const settings = await prisma.setting.findUnique({ where: { key: 'default' } });
   const storeName = settings?.storeName || 'Zamora Liquor Store';
   const currency = settings?.currency || 'KSh';
 
+  // Informational notice to receiving customer: no OTP required
   await dispatchNotification({
-    customerId: created.toCustomer.id,
+    customerId: created.transfer.toCustomer.id,
     channel: 'SMS',
-    recipient: created.toCustomer.phone,
+    recipient: created.transfer.toCustomer.phone,
     eventType: 'DEBT_TRANSFER_REQUEST',
-    subject: `Debt Transfer Request (${created.referenceNumber})`,
-    message: `${storeName}: ${created.fromCustomer.fullName} requested to transfer ${currency} ${toFixed2(
-      created.amount
-    )} debt to your account (${created.reason}). Confirm with OTP ${rawOtp} at ${confirmationUrl}`,
+    subject: `Debt Transfer Notice (${created.transfer.referenceNumber})`,
+    message: `${storeName}: ${currency} ${toFixed2(
+      created.transfer.amount
+    )} debt was transferred from ${created.transfer.fromCustomer.fullName} to your account (${created.transfer.reason}). Reference: ${created.transfer.referenceNumber}`,
   });
 
   return {
     transfer: {
-      ...created,
-      amount: toNumber(created.amount),
+      ...created.transfer,
+      amount: toNumber(created.transfer.amount),
     },
-    confirmationUrl,
-    ...(env.exposeDevOtp ? { devOtp: rawOtp, devConfirmationToken: rawToken } : {}),
+    completed: true,
+    fromNewBalance: created.fromNewBalance.toNumber(),
+    toNewBalance: created.toNewBalance.toNumber(),
   };
 }
 
@@ -412,6 +456,13 @@ export async function finalizeDebtTransferAcceptance(params: {
       throw new NotFoundError('Debt transfer request not found');
     }
 
+    if (transfer.status === 'COMPLETED') {
+      return {
+        transfer: { ...transfer, amount: toNumber(transfer.amount) },
+        alreadyCompleted: true,
+      };
+    }
+
     if (transfer.status !== 'PENDING_ACCEPTANCE') {
       throw new ConflictError(`Transfer is already ${transfer.status.toLowerCase()}`);
     }
@@ -421,15 +472,19 @@ export async function finalizeDebtTransferAcceptance(params: {
         where: { id: transfer.id },
         data: { status: 'EXPIRED' },
       });
-      throw new ValidationError('Debt transfer confirmation OTP/link has expired');
+      throw new ValidationError('Debt transfer confirmation has expired');
     }
 
-    // Verify authorization: either receiving customer's verified portal session, or valid OTP
+    // Verify authorization: either owner direct, verified portal session, or valid OTP
     const isPortalAuthorized =
-      params.bypassOtpForPortalCustomerId &&
+      Boolean(params.bypassOtpForPortalCustomerId) &&
       params.bypassOtpForPortalCustomerId === transfer.toCustomerId;
+    const isDirectAuthorized =
+      params.acceptedMethod === 'OTP_OWNER' ||
+      transfer.otpHash === 'NONE' ||
+      isPortalAuthorized;
 
-    if (!isPortalAuthorized) {
+    if (!isDirectAuthorized) {
       if (!params.otp?.trim()) {
         throw new ValidationError('Receiving customer OTP confirmation is required');
       }
@@ -532,6 +587,13 @@ export async function finalizeDebtTransferAcceptance(params: {
   });
 
   // Notify both customers with updated balances and portal links
+  if ('alreadyCompleted' in result) {
+    return {
+      transfer: result.transfer,
+      alreadyCompleted: true,
+    };
+  }
+
   await Promise.all([
     notifyCustomerDebtEvent({
       customerId: result.transfer.fromCustomer.id,

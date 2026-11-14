@@ -283,7 +283,7 @@ describe('Zamora Liquor Store - Financial, Inventory, Debt & Profit Rules', () =
     expect(fullPay.body.newBalance).toBe(0);
   });
 
-  it('requires receiving customer OTP confirmation for debt transfers and blocks transfers exceeding debt', async () => {
+  it('executes debt transfers immediately without OTP, prevents duplicate submissions, and blocks transfers exceeding debt', async () => {
     const product = await createTestProduct({ sellingPrice: 500, purchasePrice: 300, initialStock: 30 });
     const john = await createTestCustomer('John Kamau', '+254711222333', 10000);
     const peter = await createTestCustomer('Peter Otieno', '+254722333444', 10000);
@@ -311,7 +311,7 @@ describe('Zamora Liquor Store - Financial, Inventory, Debt & Profit Rules', () =
       });
     expect(exceedRes.status).toBe(422);
 
-    // Initiate valid partial transfer of KSh 2,000 from John to Peter
+    // Execute valid direct transfer of KSh 2,000 from John to Peter (No OTP required)
     const initRes = await request(app)
       .post('/api/debt/transfers')
       .set('Authorization', `Bearer ${ownerToken}`)
@@ -320,31 +320,44 @@ describe('Zamora Liquor Store - Financial, Inventory, Debt & Profit Rules', () =
         toCustomerId: peter.id,
         amount: 2000,
         reason: 'Peter agreed to cover 4 bottles',
+        idempotencyKey: 'test-trf-once-1',
       });
     expect(initRes.status).toBe(201);
-    expect(initRes.body.transfer.status).toBe('PENDING_ACCEPTANCE');
-    const confirmationToken = initRes.body.devConfirmationToken;
-    const otp = initRes.body.devOtp;
+    expect(initRes.body.transfer.status).toBe('COMPLETED');
+    expect(initRes.body.completed).toBe(true);
+    expect(initRes.body.fromNewBalance).toBe(2500);
+    expect(initRes.body.toNewBalance).toBe(2000);
 
-    // Before Peter accepts, balances MUST NOT have changed yet!
-    const johnBeforeAccept = await request(app)
+    // Balances are updated immediately
+    const johnAfter = await request(app)
       .get(`/api/customers/${john.id}`)
       .set('Authorization', `Bearer ${ownerToken}`);
-    expect(johnBeforeAccept.body.customer.account.currentBalance).toBe(4500);
+    expect(johnAfter.body.customer.account.currentBalance).toBe(2500);
 
-    // Wrong OTP must fail
-    const wrongOtpRes = await request(app)
-      .post(`/api/portal/transfer-confirm/${confirmationToken}/respond`)
-      .send({ action: 'ACCEPT', otp: '000000' });
-    expect(wrongOtpRes.status).toBe(422);
+    const peterAfter = await request(app)
+      .get(`/api/customers/${peter.id}`)
+      .set('Authorization', `Bearer ${ownerToken}`);
+    expect(peterAfter.body.customer.account.currentBalance).toBe(2000);
 
-    // Correct OTP via confirmation link finalizes transfer atomically
-    const acceptRes = await request(app)
-      .post(`/api/portal/transfer-confirm/${confirmationToken}/respond`)
-      .send({ action: 'ACCEPT', otp });
-    expect(acceptRes.status).toBe(200);
-    expect(acceptRes.body.fromNewBalance).toBe(2500);
-    expect(acceptRes.body.toNewBalance).toBe(2000);
+    // Re-sending with same idempotency key deduplicates and does not transfer twice
+    const dupRes = await request(app)
+      .post('/api/debt/transfers')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({
+        fromCustomerId: john.id,
+        toCustomerId: peter.id,
+        amount: 2000,
+        reason: 'Peter agreed to cover 4 bottles',
+        idempotencyKey: 'test-trf-once-1',
+      });
+    expect(dupRes.status).toBe(201);
+    expect(dupRes.body.deduplicated).toBe(true);
+
+    // Balances remain 2500 and 2000 (transfer only executed once)
+    const johnFinal = await request(app)
+      .get(`/api/customers/${john.id}`)
+      .set('Authorization', `Bearer ${ownerToken}`);
+    expect(johnFinal.body.customer.account.currentBalance).toBe(2500);
   });
 
   it('recognizes gross profit on credit sales separately from cash collected and computes net operating profit after expenses', async () => {
